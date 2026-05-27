@@ -1,6 +1,6 @@
-# ADR: Pod Bootstrapping
+# ADR: Lifecycle Hooks
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-27
 - **Author:** @chaodu-agent
 
