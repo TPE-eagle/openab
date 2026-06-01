@@ -347,20 +347,36 @@ pub async fn handle_reply(
         Ok(r) => {
             let body: serde_json::Value = r.json().await.unwrap_or_default();
             if body["ok"].as_bool() != Some(true) {
-                warn!(
-                    "Markdown send failed: {}, retrying as plain text",
-                    body["description"]
-                );
-                let _ = client
-                    .post(&url)
-                    .json(&serde_json::json!({
-                        "chat_id": reply.channel.id,
-                        "text": &reply.content.text,
-                        "message_thread_id": reply.channel.thread_id,
-                    }))
-                    .send()
-                    .await
-                    .map_err(|e| error!("telegram plain-text send error: {e}"));
+                let desc = body["description"].as_str().unwrap_or("unknown error");
+                if desc.contains("parse") || desc.contains("entities") {
+                    warn!("Markdown send failed: {desc}, retrying as plain text");
+                    match client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "chat_id": reply.channel.id,
+                            "text": &reply.content.text,
+                            "message_thread_id": reply.channel.thread_id,
+                        }))
+                        .send()
+                        .await
+                    {
+                        Ok(retry_r) => {
+                            let retry_body: serde_json::Value =
+                                retry_r.json().await.unwrap_or_default();
+                            if retry_body["ok"].as_bool() != Some(true) {
+                                error!(
+                                    "telegram plain-text retry failed: {}",
+                                    retry_body["description"]
+                                        .as_str()
+                                        .unwrap_or("unknown error")
+                                );
+                            }
+                        }
+                        Err(e) => error!("telegram plain-text send error: {e}"),
+                    }
+                } else {
+                    error!("telegram send failed: {desc}");
+                }
             }
         }
         Err(e) => error!("telegram send error: {e}"),
