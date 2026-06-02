@@ -1,4 +1,5 @@
 use fs2::FileExt;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -49,6 +50,9 @@ struct StoredSession {
     /// Hash of the last line at prev_line_count boundary; detects same-length rewrites.
     #[serde(default)]
     prev_last_line_hash: u64,
+    /// Last step idx read from SQLite; used for delta extraction via DB.
+    #[serde(default)]
+    last_step_idx: i64,
 }
 
 struct Session {
@@ -57,6 +61,8 @@ struct Session {
     prev_line_count: usize,
     /// Hash of the last line at prev_line_count boundary.
     prev_last_line_hash: u64,
+    /// Last step idx read from SQLite.
+    last_step_idx: i64,
 }
 
 struct Adapter {
@@ -110,18 +116,18 @@ impl Adapter {
         self.load_store_inner()
     }
 
-    /// Try to restore conversation_id, prev_line_count, and prev_last_line_hash from persisted state.
-    fn restore_session(&self, session_id: &str) -> Option<(String, usize, u64)> {
+    /// Try to restore conversation_id, prev_line_count, prev_last_line_hash, and last_step_idx from persisted state.
+    fn restore_session(&self, session_id: &str) -> Option<(String, usize, u64, i64)> {
         let store = self.load_store();
         store.sessions.get(session_id).and_then(|s| {
             s.conversation_id
                 .clone()
-                .map(|cid| (cid, s.prev_line_count, s.prev_last_line_hash))
+                .map(|cid| (cid, s.prev_line_count, s.prev_last_line_hash, s.last_step_idx))
         })
     }
 
     /// Persist a session binding (read-modify-write under single lock).
-    fn persist_session(&self, session_id: &str, conversation_id: Option<&str>, prev_line_count: usize, prev_last_line_hash: u64) {
+    fn persist_session(&self, session_id: &str, conversation_id: Option<&str>, prev_line_count: usize, prev_last_line_hash: u64, last_step_idx: i64) {
         let Some(_lock) = self.lock_state_file() else {
             return;
         };
@@ -132,6 +138,7 @@ impl Adapter {
                 conversation_id: conversation_id.map(String::from),
                 prev_line_count,
                 prev_last_line_hash,
+                last_step_idx,
             },
         );
         let tmp = self.state_file.with_extension("tmp");
@@ -222,6 +229,89 @@ impl Adapter {
         (delta, total, last_hash)
     }
 
+    /// Extract text from a protobuf blob by reading field 8 (tag 0x42 = field 8, wire type 2).
+    fn extract_text_from_step_payload(blob: &[u8]) -> Option<String> {
+        let mut i = 0;
+        while i < blob.len() {
+            // Read varint tag
+            let (tag, consumed) = Self::read_varint(&blob[i..])?;
+            i += consumed;
+            let field_number = tag >> 3;
+            let wire_type = tag & 0x7;
+            match wire_type {
+                0 => {
+                    // Varint — skip
+                    let (_, c) = Self::read_varint(&blob[i..])?;
+                    i += c;
+                }
+                2 => {
+                    // Length-delimited
+                    let (len, c) = Self::read_varint(&blob[i..])?;
+                    i += c;
+                    let len = len as usize;
+                    if i + len > blob.len() {
+                        return None;
+                    }
+                    if field_number == 8 {
+                        // This is the text content field
+                        return String::from_utf8(blob[i..i + len].to_vec()).ok();
+                    }
+                    i += len;
+                }
+                5 => { i += 4; }  // 32-bit
+                1 => { i += 8; }  // 64-bit
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Read a protobuf varint, returning (value, bytes_consumed).
+    fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        for (i, &byte) in buf.iter().enumerate() {
+            if shift >= 70 {
+                return None;
+            }
+            result |= ((byte & 0x7F) as u64) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return Some((result, i + 1));
+            }
+        }
+        None
+    }
+
+    /// Read the latest response from the SQLite conversation DB.
+    /// Returns (response_text, max_step_idx) or None if reading fails.
+    fn read_response_from_db(&self, conversation_id: &str, after_step_idx: i64) -> Option<(String, i64)> {
+        let db_path = self.conversations_dir.join(format!("{}.db", conversation_id));
+        let conn = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        // Query steps with idx > last known, looking for response steps
+        let mut stmt = conn.prepare(
+            "SELECT idx, step_payload FROM steps WHERE idx > ?1 ORDER BY idx"
+        ).ok()?;
+        let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([after_step_idx], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        }).ok()?.filter_map(|r| r.ok()).collect();
+
+        let mut max_idx = after_step_idx;
+        let mut response_parts: Vec<String> = Vec::new();
+        for (idx, payload) in &rows {
+            max_idx = max_idx.max(*idx);
+            if let Some(text) = Self::extract_text_from_step_payload(payload) {
+                if !text.is_empty() {
+                    response_parts.push(text);
+                }
+            }
+        }
+        if response_parts.is_empty() {
+            return None;
+        }
+        Some((response_parts.join("\n"), max_idx))
+    }
+
     fn evict_if_needed(&mut self) {
         const MAX_SESSIONS: usize = 64;
         while self.sessions.len() >= MAX_SESSIONS {
@@ -232,7 +322,7 @@ impl Adapter {
     }
 
     fn restore_session_state(&mut self, session_id: &str) -> bool {
-        let Some((conversation_id, prev_line_count, prev_last_line_hash)) = self.restore_session(session_id) else {
+        let Some((conversation_id, prev_line_count, prev_last_line_hash, last_step_idx)) = self.restore_session(session_id) else {
             return false;
         };
         // Evict only after confirming the restore target exists
@@ -245,6 +335,7 @@ impl Adapter {
                 conversation_id: Some(conversation_id),
                 prev_line_count,
                 prev_last_line_hash,
+                last_step_idx,
             },
         );
         true
@@ -273,6 +364,7 @@ impl Adapter {
                 conversation_id,
                 prev_line_count: 0,
                 prev_last_line_hash: 0,
+                last_step_idx: -1,
             },
         );
         JsonRpcResponse {
@@ -409,51 +501,59 @@ impl Adapter {
 
                 let full_text = String::from_utf8_lossy(&output.stdout).to_string();
 
-                let prev_line_count = self
-                    .sessions
-                    .get(session_id)
-                    .map(|s| s.prev_line_count)
-                    .unwrap_or(0);
-                let prev_last_line_hash = self
-                    .sessions
-                    .get(session_id)
-                    .map(|s| s.prev_last_line_hash)
-                    .unwrap_or(0);
-                let conversation_bound = self
-                    .sessions
-                    .get(session_id)
-                    .map(|s| s.conversation_id.is_some())
-                    .unwrap_or(false);
-                let (new_text, total_lines, last_hash) = Self::extract_delta(&full_text, prev_line_count, prev_last_line_hash, conversation_bound);
-
                 // Bind conversation from snapshot diff
                 let conv_id = snapshot
                     .as_ref()
                     .and_then(|before| self.new_conversation_id(before));
 
-                let mut should_persist = false;
                 if let Some(session) = self.sessions.get_mut(session_id) {
-                    let newly_bound = session.conversation_id.is_none() && conv_id.is_some();
                     if session.conversation_id.is_none() {
                         session.conversation_id = conv_id.clone();
                     }
+                }
+
+                let bound_conv_id = self.sessions.get(session_id).and_then(|s| s.conversation_id.clone());
+                let last_step_idx = self.sessions.get(session_id).map(|s| s.last_step_idx).unwrap_or(-1);
+
+                // Primary: read response from SQLite .db
+                let (new_text, new_step_idx) = if let Some(cid) = &bound_conv_id {
+                    match self.read_response_from_db(cid, last_step_idx) {
+                        Some((text, idx)) => {
+                            eprintln!("[agy-acp] delta from SQLite (steps {} → {})", last_step_idx, idx);
+                            (text, idx)
+                        }
+                        None => {
+                            // Fallback: use stdout line-count delta
+                            eprintln!("[agy-acp] SQLite read failed, falling back to stdout delta");
+                            let prev_line_count = self.sessions.get(session_id).map(|s| s.prev_line_count).unwrap_or(0);
+                            let prev_last_line_hash = self.sessions.get(session_id).map(|s| s.prev_last_line_hash).unwrap_or(0);
+                            let conversation_bound = true;
+                            let (text, _, _) = Self::extract_delta(&full_text, prev_line_count, prev_last_line_hash, conversation_bound);
+                            (text, last_step_idx)
+                        }
+                    }
+                } else {
+                    // No conversation bound — send full text
+                    eprintln!("[agy-acp] WARN: could not bind conversation ID; running in single-turn mode");
+                    (full_text.clone(), -1i64)
+                };
+
+                // Update session state
+                let total_lines = full_text.lines().count();
+                let last_hash = full_text.lines().last().map(|l| Self::line_hash(l)).unwrap_or(0);
+                let mut should_persist = false;
+                if let Some(session) = self.sessions.get_mut(session_id) {
                     if session.conversation_id.is_some() {
                         session.prev_line_count = total_lines;
                         session.prev_last_line_hash = last_hash;
+                        session.last_step_idx = new_step_idx;
                         should_persist = true;
-                    } else {
-                        session.prev_line_count = 0;
-                        session.prev_last_line_hash = 0;
-                        eprintln!(
-                            "[agy-acp] WARN: could not bind conversation ID; \
-                             running in single-turn mode"
-                        );
                     }
-                    let _ = newly_bound; // persist regardless — line count changed
                 }
                 if should_persist {
                     let cid = self.sessions.get(session_id).and_then(|s| s.conversation_id.clone());
-                    self.persist_session(session_id, cid.as_deref(), total_lines, last_hash);
+                    let step_idx = self.sessions.get(session_id).map(|s| s.last_step_idx).unwrap_or(-1);
+                    self.persist_session(session_id, cid.as_deref(), total_lines, last_hash, step_idx);
                 }
 
                 let notification = serde_json::to_string(&JsonRpcNotification {
@@ -653,7 +753,7 @@ mod tests {
             conversations_dir: root.join("conversations"),
             state_file: root.join("sessions.json"),
         };
-        adapter.persist_session("sess-1", Some("conv-abc"), 10, 12345);
+        adapter.persist_session("sess-1", Some("conv-abc"), 10, 12345, 5);
 
         let response = adapter.handle_session_load(7, &json!({"sessionId": "sess-1"}));
         assert!(response.error.is_none());
@@ -799,9 +899,9 @@ mod tests {
             state_file: root.join("sessions.json"),
         };
 
-        adapter.persist_session("sess-1", Some("conv-abc"), 7, 99999);
+        adapter.persist_session("sess-1", Some("conv-abc"), 7, 99999, 3);
         let restored = adapter.restore_session("sess-1");
-        assert_eq!(restored, Some(("conv-abc".to_string(), 7, 99999)));
+        assert_eq!(restored, Some(("conv-abc".to_string(), 7, 99999, 3)));
 
         let missing = adapter.restore_session("sess-unknown");
         assert_eq!(missing, None);
