@@ -243,6 +243,13 @@ impl Adapter {
             }
         }
         if response_parts.is_empty() {
+            if !rows.is_empty() {
+                eprintln!(
+                    "[agy-acp] WARN: {} new steps found but none had extractable text \
+                     (protobuf field 8 missing — schema change?)",
+                    rows.len()
+                );
+            }
             return None;
         }
         Some((response_parts.join("\n"), max_idx))
@@ -452,9 +459,9 @@ impl Adapter {
                             (text, idx)
                         }
                         None => {
-                            // DB read failed — use full stdout as last resort
-                            eprintln!("[agy-acp] WARN: SQLite read returned no text, using stdout");
-                            (full_text.clone(), last_step_idx)
+                            // DB read returned no text — likely schema change or empty response
+                            eprintln!("[agy-acp] WARN: SQLite read returned no new text (step_payload field 8 missing?)");
+                            (String::new(), last_step_idx)
                         }
                     }
                 } else {
