@@ -466,6 +466,26 @@ mod tests {
         }
     }
 
+    fn make_reply_with_command(event_id: &str, command: &str, text: &str) -> schema::GatewayReply {
+        schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: event_id.into(),
+            platform: "line".into(),
+            channel: schema::ReplyChannel {
+                id: "U1234".into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+            command: Some(command.into()),
+            request_id: None,
+            quote_message_id: None,
+        }
+    }
+
     fn make_cache() -> ReplyTokenCache {
         Arc::new(std::sync::Mutex::new(HashMap::new()))
     }
@@ -510,6 +530,46 @@ mod tests {
         .await;
 
         assert!(used, "should report Reply API was used");
+    }
+
+    /// Unsupported LINE commands should be ignored and must not consume the cached reply token.
+    #[tokio::test]
+    async fn line_ignores_reaction_commands_without_touching_cache() {
+        let server = MockServer::start().await;
+        let _reply = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache = make_cache();
+        cache
+            .lock()
+            .unwrap()
+            .insert("evt_reaction".into(), ("tok_reaction".into(), Instant::now()));
+
+        let client = reqwest::Client::new();
+        let used = adapters::line::dispatch_line_reply(
+            &client,
+            "test_access_token",
+            &cache,
+            &make_reply_with_command("evt_reaction", "add_reaction", "👀"),
+            &server.uri(),
+        )
+        .await;
+
+        assert!(!used, "ignored LINE commands should not report reply usage");
+        assert!(
+            cache.lock().unwrap().contains_key("evt_reaction"),
+            "ignored LINE commands should not consume the cached reply token"
+        );
     }
 
     /// Cache miss: falls back to Push API with correct "to", bearer token, and message body.
