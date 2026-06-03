@@ -47,6 +47,9 @@ jobs:
 
       - name: Run E2E test
         working-directory: agy-acp
-        run: cargo test e2e -- --ignored --nocapture
+        run: |
+          mkdir -p ~/.gemini/antigravity-cli
+          echo '{}' > ~/.gemini/antigravity-cli/settings.json
+          cargo test e2e -- --ignored --nocapture
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
