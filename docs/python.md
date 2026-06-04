@@ -1,6 +1,16 @@
 # Running Python Scripts in OpenAB
 
-OpenAB Docker images do **not** ship a system Python. This keeps images small and avoids version conflicts. Instead, use [`uv`](https://docs.astral.sh/uv/) — which is pre-installed in all OAB images — to run Python scripts on demand.
+OpenAB Docker images do **not** ship a system Python or `uv`. This keeps images small and avoids version conflicts. The recommended way to run Python scripts is with [`uv`](https://docs.astral.sh/uv/).
+
+## Installing `uv`
+
+On first use, the AI agent will typically install `uv` automatically. You can also install it manually:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+This installs `uv` to `~/.local/bin/`. Once installed, `uv run` handles everything else — downloading Python, managing dependencies, and executing your script.
 
 ## Quick Start
 
