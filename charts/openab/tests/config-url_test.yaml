@@ -24,7 +24,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].args
-          value: ["run", "-c", "https://example.com/config.toml"]
+          value: ["openab", "run", "-c", "https://example.com/config.toml"]
 
   - it: does not set args when configUrl is empty
     template: templates/deployment.yaml

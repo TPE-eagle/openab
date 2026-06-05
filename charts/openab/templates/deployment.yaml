@@ -46,7 +46,7 @@ spec:
           image: {{ include "openab.agentImage" $d | quote }}
           imagePullPolicy: {{ include "openab.agentImagePullPolicy" $d }}
           {{- if $cfg.configUrl }}
-          args: ["run", "-c", {{ $cfg.configUrl | quote }}]
+          args: ["openab", "run", "-c", {{ $cfg.configUrl | quote }}]
           {{- end }}
           {{- with $.Values.containerSecurityContext }}
           securityContext:
