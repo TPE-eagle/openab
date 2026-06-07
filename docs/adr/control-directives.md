@@ -92,6 +92,31 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 - The canonical workspace is stored in `SessionMetadata` and reused for session creation, session load/resume, eviction rebuilds, and any persisted session mapping. A `[[ws:...]]` session must never resume in the configured default working directory unless that was the resolved workspace.
 - Workspace steering defines repo context (remote URL, branch, etc.) — no separate repo binding needed in Phase 1
 
+#### Workspace Aliases
+
+Full paths are verbose for frequent use. The operator may define workspace aliases in `config.toml`:
+
+```toml
+[workspace.aliases]
+openab = "~/projects/openab"
+infra  = "~/projects/infra-cdk"
+web    = "~/projects/frontend"
+```
+
+Users reference aliases with an `@` prefix:
+
+```
+@Bot [[ws:@openab]] [[title:Fix CI]]
+help me debug the smoke test
+```
+
+Resolution order:
+1. If value starts with `@`, look up alias in `workspace.aliases`
+2. If alias not found → reject with user-visible error listing available aliases
+3. If found → substitute the full path, then apply the same canonicalize + security check as raw paths
+
+Aliases are syntactic sugar — they resolve before any security validation and produce identical `SessionMetadata` to raw paths.
+
 ### 3.2 `[[title:...]]` — Thread Title
 
 - Sets the initial thread/channel title
@@ -175,14 +200,15 @@ For multi-value keys (e.g., `[[label:a]] [[label:b]]`), a future revision may in
 
 ## 6. Implementation Plan
 
-### Phase 1: Parser + `ws` + `title`
+### Phase 1: Parser + `ws` (with aliases) + `title`
 
 1. Implement directive parser as a middleware in the message ingestion pipeline
 2. Define `SessionMetadata` struct
 3. Persist `SessionMetadata` per session key so workspace survives reconnect, resume, and eviction rebuilds
-4. Wire `[[ws:...]]` to workspace/context loading
-5. Wire `[[title:...]]` to thread title initialization
-6. Unit tests for parser edge cases (nested brackets, escaped content, empty values, body text that contains directive-like literals)
+4. Add `[workspace.aliases]` table to `config.toml` schema
+5. Wire `[[ws:...]]` to workspace/context loading (raw paths and `@alias` resolution)
+6. Wire `[[title:...]]` to thread title initialization
+7. Unit tests for parser edge cases (nested brackets, escaped content, empty values, body text that contains directive-like literals, unknown alias error)
 
 ### Phase 2: `model`
 
