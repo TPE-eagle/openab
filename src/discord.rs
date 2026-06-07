@@ -188,7 +188,13 @@ impl ChatAdapter for DiscordAdapter {
 
     async fn rename_thread(&self, channel: &ChannelRef, title: &str) -> Result<()> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        let truncated = if title.len() > 100 { &title[..100] } else { title };
+        // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
+        let truncated: &str = if title.chars().count() > 100 {
+            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            &title[..end]
+        } else {
+            title
+        };
         ChannelId::new(ch_id)
             .edit(&self.http, EditChannel::new().name(truncated))
             .await?;

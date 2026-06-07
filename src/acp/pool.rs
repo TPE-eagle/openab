@@ -94,7 +94,7 @@ impl SessionPool {
     fn load_mapping(path: &Path) -> HashMap<String, String> {
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                warn!(path = %path.display(), error = %e, "corrupt thread_map.json, starting fresh");
+                warn!(path = %path.display(), error = %e, "corrupt mapping file, starting fresh");
                 HashMap::new()
             }),
             Err(_) => HashMap::new(),
@@ -206,11 +206,13 @@ impl SessionPool {
         };
 
         // Persist the workspace override for future reconnects/eviction rebuilds.
+        // Only persist on first assignment (session directives are immutable per ADR).
         if working_dir_override.is_some() {
             let mut state = self.state.write().await;
             state
                 .session_workdirs
-                .insert(thread_id.to_string(), effective_workdir.clone());
+                .entry(thread_id.to_string())
+                .or_insert_with(|| effective_workdir.clone());
             self.save_meta(&state.session_workdirs);
         }
 
@@ -432,7 +434,9 @@ impl SessionPool {
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
         state.creating.remove(thread_id);
+        state.session_workdirs.remove(thread_id);
         self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
         if had_active {
             info!(thread_id, "session reset");
             Ok(())
