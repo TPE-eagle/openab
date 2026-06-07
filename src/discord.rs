@@ -186,7 +186,7 @@ impl ChatAdapter for DiscordAdapter {
         Ok(())
     }
 
-    async fn rename_thread(&self, channel: &ChannelRef, title: &str) -> Result<()> {
+    async fn rename_thread(&self, channel: &ChannelRef, title: &str) -> anyhow::Result<()> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
         let truncated: &str = if title.chars().count() > 100 {
