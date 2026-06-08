@@ -76,8 +76,9 @@ pub fn format_coded_error(code: i64, message: &str, data_message: Option<&str>) 
     } else {
         format!("{} (code: {})\n{}", prefix, code, message)
     };
-    if let Some(detail) = data_message {
-        if !detail.is_empty() && !message.contains(detail) {
+    let detail = data_message.filter(|s| !s.is_empty());
+    if let Some(detail) = detail {
+        if !message.contains(detail) {
             out.push_str("\n> ");
             out.push_str(detail);
         }
