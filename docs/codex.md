@@ -203,9 +203,11 @@ manual approval is impractical and Full Access removes all guardrails.
 Enable Auto-review in `/home/node/.codex/config.toml`:
 
 ```toml
-[sandbox]
 approval_policy = "auto-review"
 ```
+
+> `approval_policy` is a **top-level** key in `config.toml`, not under a
+> `[sandbox]` section. Codex silently ignores it if nested.
 
 Or pass it at install time via Helm:
 
@@ -264,10 +266,15 @@ runtime already provides isolation):
 
 ```toml
 # /home/node/.codex/config.toml
-[sandbox]
 sandbox_mode = "danger-full-access"
 approval_policy = "on-request"
 ```
+
+> `sandbox_mode` and `approval_policy` are **top-level** keys in `config.toml`.
+> A `[sandbox]` section header is silently ignored by Codex 0.137+ — verified
+> empirically: with the nested form in place, `codex exec` still fails with
+> `bwrap: No permissions to create new namespace`; moving the same keys to the
+> top level makes `codex exec` report `sandbox: danger-full-access` and run.
 
 Or launch with:
 
