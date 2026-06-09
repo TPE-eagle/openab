@@ -138,8 +138,7 @@ working_dir = "/home/node"
 
 # Codex
 [agent]
-command = "codex"
-args = ["--acp"]
+command = "codex-acp"
 working_dir = "/home/node"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
