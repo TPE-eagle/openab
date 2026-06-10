@@ -50,8 +50,14 @@ If you need full control, use `[agent]` directly:
 ```toml
 [agent]
 command = "uv"
-args = ["run", "--script", "agentcore-acp/agentcore_acp.py", "--runtime-arn", "arn:aws:...", "--region", "us-east-1"]
+args = ["run", "--script", "/opt/agentcore-acp/agentcore_acp.py", "--runtime-arn", "arn:aws:...", "--region", "us-east-1"]
 ```
+
+### Priority rules
+
+1. Explicit `[agent]` with `command = "..."` always wins — `[agentcore]` is ignored
+2. `OPENAB_AGENT_COMMAND` env var alone does NOT count as explicit — `[agentcore]` overrides it
+3. If neither `[agent].command` nor `[agentcore]` is set, falls back to `OPENAB_AGENT_COMMAND` or `openab-agent`
 
 ## Docker Image
 

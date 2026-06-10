@@ -74,14 +74,41 @@ pub struct AgentCoreConfig {
     pub region: String,
     /// Cancel strategy: "noop" or "stop" (default: stop)
     #[serde(default = "default_agentcore_cancel_strategy")]
-    pub cancel_strategy: String,
+    pub cancel_strategy: AgentCoreCancelStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentCoreCancelStrategy {
+    #[default]
+    Stop,
+    Noop,
+}
+
+impl<'de> Deserialize<'de> for AgentCoreCancelStrategy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "stop" => Ok(Self::Stop),
+            "noop" => Ok(Self::Noop),
+            other => Err(serde::de::Error::unknown_variant(other, &["stop", "noop"])),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentCoreCancelStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stop => write!(f, "stop"),
+            Self::Noop => write!(f, "noop"),
+        }
+    }
 }
 
 fn default_agentcore_region() -> String {
     "us-east-1".into()
 }
-fn default_agentcore_cancel_strategy() -> String {
-    "stop".into()
+fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
+    AgentCoreCancelStrategy::Stop
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,6 +488,8 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
+    pub command_explicit: bool,
 }
 
 impl Default for AgentConfig {
@@ -471,6 +500,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            command_explicit: false,
         }
     }
 }
@@ -496,6 +526,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            command_explicit: cmd_explicit,
         })
     }
 }
@@ -880,23 +911,24 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     // If [agentcore] is set and [agent] command was not explicitly provided,
     // synthesize agent config to spawn the bundled agentcore-acp adapter.
     if let Some(ref ac) = config.agentcore {
-        if config.agent.command == default_agent_command() {
+        if !config.agent.command_explicit {
             config.agent = AgentConfig {
                 command: "uv".into(),
                 args: vec![
                     "run".into(),
                     "--script".into(),
-                    "agentcore-acp/agentcore_acp.py".into(),
+                    "/opt/agentcore-acp/agentcore_acp.py".into(),
                     "--runtime-arn".into(),
                     ac.runtime_arn.clone(),
                     "--region".into(),
                     ac.region.clone(),
                     "--cancel-strategy".into(),
-                    ac.cancel_strategy.clone(),
+                    ac.cancel_strategy.to_string(),
                 ],
                 working_dir: config.agent.working_dir.clone(),
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                command_explicit: true, // synthesized counts as explicit
             };
         }
     }
@@ -1323,6 +1355,6 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.region, "us-east-1");
-        assert_eq!(ac.cancel_strategy, "stop");
+        assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
     }
 }
