@@ -45,8 +45,41 @@ def write_notification(method: str, params: dict):
 # ---------------------------------------------------------------------------
 
 SENDER_CTX_RE = re.compile(
-    r"<sender_context>\s*(\{.*?\})\s*</sender_context>", re.DOTALL
+    r"<sender_context>\s*(.*?)\s*</sender_context>", re.DOTALL
 )
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the first complete JSON object from text using brace counting."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 def extract_session_id_from_prompt(blocks: list) -> str | None:
@@ -55,8 +88,8 @@ def extract_session_id_from_prompt(blocks: list) -> str | None:
         if isinstance(block, dict) and block.get("type") == "text":
             m = SENDER_CTX_RE.search(block.get("text", ""))
             if m:
-                try:
-                    ctx = json.loads(m.group(1))
+                ctx = _extract_json_object(m.group(1))
+                if ctx:
                     platform = ctx.get("channel", "unknown")
                     thread_id = ctx.get("thread_id") or ctx.get("channel_id", "")
                     sid = f"oab-{platform}-thread-{thread_id}"
@@ -64,8 +97,6 @@ def extract_session_id_from_prompt(blocks: list) -> str | None:
                     if len(sid) < 33:
                         sid = sid + "0" * (33 - len(sid))
                     return sid
-                except (json.JSONDecodeError, KeyError):
-                    pass
     return None
 
 
@@ -110,6 +141,9 @@ class AgentCoreClient:
 
         if "text/event-stream" in content_type:
             # SSE streaming response
+            # TODO(phase2): Replace iter_lines() with proper SSE parser (httpx-sse)
+            # to handle TCP chunk boundaries correctly. Acceptable for PoC since
+            # AgentCore likely flushes complete lines per event.
             for line in response["response"].iter_lines(chunk_size=1024):
                 if not line:
                     continue
@@ -163,11 +197,20 @@ class AcpAdapter:
     def __init__(self, client: AgentCoreClient):
         self.client = client
         self.sessions: dict[str, str] = {}  # acp_session_id → runtime_session_id
-        self._lock = threading.Lock()  # per-session invoke serialization
+        self._sessions_lock = threading.Lock()  # protects self.sessions dict
+        self._session_locks: dict[str, threading.Lock] = {}  # per-session invoke mutex
+
+    def _get_session_lock(self, acp_sid: str) -> threading.Lock:
+        """Get or create a per-session lock for invoke serialization."""
+        with self._sessions_lock:
+            if acp_sid not in self._session_locks:
+                self._session_locks[acp_sid] = threading.Lock()
+            return self._session_locks[acp_sid]
 
     def handle_session_new(self, id: int, params: dict):
         acp_sid = f"agentcore-{int(time.time() * 1000)}"
-        self.sessions[acp_sid] = ""  # runtime session ID determined on first prompt
+        with self._sessions_lock:
+            self.sessions[acp_sid] = ""  # runtime session ID determined on first prompt
         write_response(id, {"sessionId": acp_sid})
 
     def handle_session_prompt(self, id: int, params: dict):
@@ -175,7 +218,8 @@ class AcpAdapter:
         blocks = params.get("prompt", [])
 
         # Determine runtime session ID from sender_context
-        runtime_sid = self.sessions.get(acp_sid, "")
+        with self._sessions_lock:
+            runtime_sid = self.sessions.get(acp_sid, "")
         if not runtime_sid:
             runtime_sid = extract_session_id_from_prompt(blocks)
             if not runtime_sid:
@@ -183,15 +227,17 @@ class AcpAdapter:
                 runtime_sid = f"oab-fallback-{acp_sid}"
                 if len(runtime_sid) < 33:
                     runtime_sid = runtime_sid + "0" * (33 - len(runtime_sid))
-            self.sessions[acp_sid] = runtime_sid
+            with self._sessions_lock:
+                self.sessions[acp_sid] = runtime_sid
 
         # Extract plain prompt text
         prompt_text = strip_sender_context(blocks)
         if not prompt_text:
             prompt_text = "hello"
 
-        # Invoke with serialization
-        with self._lock:
+        # Invoke with per-session serialization
+        session_lock = self._get_session_lock(acp_sid)
+        with session_lock:
             cold_start_notified = False
             start_time = time.time()
 
@@ -235,15 +281,17 @@ class AcpAdapter:
 
     def handle_cancel(self, params: dict):
         acp_sid = params.get("sessionId", "")
-        runtime_sid = self.sessions.get(acp_sid, "")
+        with self._sessions_lock:
+            runtime_sid = self.sessions.get(acp_sid, "")
         if runtime_sid:
             self.client.cancel(runtime_sid)
 
     def handle_session_load(self, id: int, params: dict):
         """Resume a session — with deterministic IDs, just store the mapping."""
         acp_sid = params.get("sessionId", "")
-        if acp_sid not in self.sessions:
-            self.sessions[acp_sid] = ""  # Will be resolved on next prompt
+        with self._sessions_lock:
+            if acp_sid not in self.sessions:
+                self.sessions[acp_sid] = ""  # Will be resolved on next prompt
         write_response(id, {"sessionId": acp_sid})
 
     def run(self):
@@ -265,7 +313,7 @@ class AcpAdapter:
                 self.handle_session_new(msg_id, params)
             elif method == "session/prompt":
                 self.handle_session_prompt(msg_id, params)
-            elif method == "session/cancel":
+            elif method in ("session/cancel", "cancel"):
                 self.handle_cancel(params)
             elif method == "session/load":
                 self.handle_session_load(msg_id, params)
