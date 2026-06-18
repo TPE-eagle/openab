@@ -1,0 +1,100 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, labeled]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  statuses: write
+  issues: write
+
+jobs:
+  request-review:
+    if: >-
+      !github.event.pull_request.draft &&
+      !contains(toJSON(github.event.pull_request.labels.*.name), 'review-limit-reached') &&
+      (github.event.action != 'labeled' ||
+       github.event.label.name == 'safe-to-review' ||
+       github.event.label.name == 'auto-fix') &&
+      (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'),
+        github.event.pull_request.author_association) ||
+      contains(toJSON(github.event.pull_request.labels.*.name), 'safe-to-review'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Circuit breaker — max 30 review cycles
+        id: breaker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          SHAS=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits" \
+            --jq '.[].sha')
+          if [ -z "$SHAS" ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          COUNT=0
+          for SHA in $SHAS; do
+            N=$(gh api "repos/${{ github.repository }}/commits/${SHA}/statuses" \
+              --paginate --jq '[.[] | select(.context == "OpenAB PR Review" and .state == "pending")] | length' \
+              | awk '{s+=$1} END {print s+0}')
+            COUNT=$((COUNT + N))
+          done
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          if [ "${COUNT}" -ge 30 ]; then
+            gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
+              --method POST -f "labels[]=review-limit-reached"
+            gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+              -f state="error" \
+              -f context="OpenAB PR Review" \
+              -f description="Circuit breaker: exceeded 30 review cycles"
+            echo "::error::Circuit breaker triggered after $COUNT review cycles"
+            exit 1
+          fi
+
+      - name: Set pending status
+        id: pending
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          gh api repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state="pending" \
+            -f context="OpenAB PR Review" \
+            -f description="Review in progress..." \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Trigger review via Discord webhook
+        id: webhook
+        env:
+          HAS_AUTOFIX: ${{ contains(toJSON(github.event.pull_request.labels.*.name), 'auto-fix') }}
+          WEBHOOK_URL: ${{ secrets.OAB_REVIEW_ACTION_WEBHOOK }}
+          BOT_UID: ${{ secrets.OAB_REVIEW_ACTION_BOT_UID }}
+        run: |
+          set -eo pipefail
+          PR_URL="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          SHA="${{ github.event.pull_request.head.sha }}"
+          MODE=""
+          if [ "$HAS_AUTOFIX" = "true" ]; then
+            MODE="\n__mode: auto-fix__"
+          fi
+          PAYLOAD=$(jq -n --arg content "<@${BOT_UID}> review ${PR_URL}\n\n__commit: ${SHA}__${MODE}" \
+            '{"content": $content}')
+          curl -sS --fail-with-body --max-time 10 -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      - name: Mark error on Discord failure
+        if: failure() && steps.breaker.outcome == 'success' && steps.webhook.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state="error" \
+            -f context="OpenAB PR Review" \
+            -f description="Failed to trigger review — check workflow logs"
