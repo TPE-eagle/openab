@@ -72,7 +72,8 @@ async fn apply_ecs(
     };
 
     let service_name = m.ecs_service_name();
-    let bucket = "oab-control-plane";
+    let bucket = std::env::var("OAB_CONTROL_PLANE_BUCKET")
+        .unwrap_or_else(|_| "oab-control-plane".to_string());
 
     // Read current generation from S3 manifest (if exists), increment
     let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
