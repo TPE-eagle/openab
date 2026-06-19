@@ -8,6 +8,9 @@ CLI tool that provisions and manages OpenAB agents on Amazon ECS Fargate (with K
 # Build
 cd operator && cargo build --release
 
+# Bootstrap infrastructure (one-time)
+oabctl bootstrap
+
 # Deploy an agent
 oabctl apply -f examples/kiro-01.yaml
 
@@ -109,6 +112,28 @@ Each agent inherits from `template` and can override: `image`, `resources`, `boo
 ## JSON Schema
 
 The manifest schema is defined in [`schema/oabservice-v2.json`](schema/oabservice-v2.json) for IDE validation.
+
+## Bootstrap
+
+One-time infrastructure setup — similar to `cdk bootstrap`:
+
+```bash
+oabctl bootstrap              # create all infra
+oabctl bootstrap --status     # show current state
+oabctl bootstrap --delete     # teardown everything
+```
+
+Creates:
+| Resource | Name | Purpose |
+|----------|------|---------|
+| ECS Cluster | `oab` | Agent execution (FARGATE + FARGATE_SPOT) |
+| IAM Role | `oab-task-execution` | Pull images, read secrets |
+| IAM Role | `oab-task-role` | Agent runtime (SSM, S3) |
+| S3 Bucket | `oab-control-plane-{account}` | State store |
+| Security Group | `oab-agents` | Outbound-only networking |
+| CloudWatch Log Group | `/oab/agents` | Agent logs |
+
+State is tracked in `s3://oab-control-plane-{account}/bootstrap/state.json` for idempotent creates and clean teardown.
 
 ## State Store
 

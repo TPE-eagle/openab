@@ -1,3 +1,4 @@
+use crate::bootstrap::BootstrapState;
 use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime};
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
@@ -6,6 +7,16 @@ use aws_sdk_ecs::types::{
 };
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
+
+/// Try to load bootstrap state for networking defaults
+async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
+    let sts = aws_sdk_sts::Client::new(config);
+    let account = sts.get_caller_identity().send().await.ok()?
+        .account()?.to_string();
+    let bucket = format!("oab-control-plane-{account}");
+    let s3 = aws_sdk_s3::Client::new(config);
+    crate::bootstrap::load_state_pub(&s3, &bucket).await.ok().flatten()
+}
 
 pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<()> {
     let path = Path::new(file_path);

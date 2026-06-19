@@ -1,5 +1,6 @@
 mod manifest;
 mod apply;
+mod bootstrap;
 mod get;
 mod delete;
 
@@ -65,6 +66,18 @@ enum Commands {
         /// Destination: agent:/path or local dir
         dst: String,
     },
+    /// Bootstrap OAB infrastructure (cluster, IAM roles, S3, security group)
+    Bootstrap {
+        /// Delete all bootstrap resources
+        #[arg(long)]
+        delete: bool,
+        /// Show current bootstrap status
+        #[arg(long)]
+        status: bool,
+        /// AWS region (defaults to AWS_DEFAULT_REGION or us-east-1)
+        #[arg(long)]
+        region: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -116,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
             }
             eprintln!("✓ Done");
             Ok(())
+        }
+        Commands::Bootstrap { delete, status, region: _ } => {
+            bootstrap::run(&config, delete, status).await
         }
     }
 }
