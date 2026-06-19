@@ -309,7 +309,7 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         .send().await.ok();
     // S3 access
     let s3_policy = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*","arn:aws:s3:::ecsctl-staging-{account}/*"]}}]}}"#
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
     );
     iam.put_role_policy()
         .role_name(TASK_ROLE)
