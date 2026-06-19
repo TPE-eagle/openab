@@ -47,8 +47,8 @@ enum Commands {
     Exec {
         /// Agent name (alias)
         agent: String,
-        /// Command to run
-        #[arg(last = true)]
+        /// Command to run (default: /bin/sh). Use -- to separate args.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Copy files to/from agent containers (via ecsctl)
@@ -58,11 +58,11 @@ enum Commands {
         /// Destination path (local or agent:/path)
         dst: String,
     },
-    /// Sync a local directory to an agent container (via ecsctl)
+    /// Sync directories between local machine and agent containers (via ecsctl)
     Sync {
-        /// Source directory
+        /// Source: local dir or agent:/path
         src: String,
-        /// Destination (agent:/path)
+        /// Destination: agent:/path or local dir
         dst: String,
     },
 }
@@ -78,17 +78,48 @@ async fn main() -> anyhow::Result<()> {
         Commands::Delete { resource, name, cluster, namespace } => {
             delete::run(&config, &resource, &name, &cluster, &namespace).await
         }
-        // TODO: Wire up ecsctl library once its API is refactored for library use.
-        // Blocked on: oablab/ecsctl library API readiness (functions currently
-        // shell out to `aws` CLI and print directly to stderr).
         Commands::Exec { agent, command } => {
-            anyhow::bail!("exec not yet implemented — pending ecsctl library API refactor")
+            let resolved = ecsctl::alias::resolve(&config, &agent).await?;
+            let cmd = if command.is_empty() {
+                None
+            } else {
+                // Preserve quoting: each arg that contains spaces gets quoted
+                let joined = command.iter().map(|a| {
+                    if a.contains(' ') || a.contains('"') || a.contains('\'') {
+                        format!("\"{}\"", a.replace('"', "\\\""))
+                    } else {
+                        a.clone()
+                    }
+                }).collect::<Vec<_>>().join(" ");
+                Some(joined)
+            };
+            ecsctl::exec::run(&config, &resolved, cmd.as_deref()).await
         }
         Commands::Cp { src, dst } => {
-            anyhow::bail!("cp not yet implemented — pending ecsctl library API refactor")
+            let src = ecsctl::alias::resolve_remote(&config, &src).await?;
+            let dst = ecsctl::alias::resolve_remote(&config, &dst).await?;
+            eprintln!("⇄ Copying {} → {} ...", src, dst);
+            ecsctl::cp::run(&config, &src, &dst, None, 60).await?;
+            eprintln!("✓ Done");
+            Ok(())
         }
         Commands::Sync { src, dst } => {
-            anyhow::bail!("sync not yet implemented — pending ecsctl library API refactor")
+            let src = ecsctl::alias::resolve_remote(&config, &src).await?;
+            let dst = ecsctl::alias::resolve_remote(&config, &dst).await?;
+            let src_remote = src.contains(':') && !src.starts_with('/');
+            let dst_remote = dst.contains(':') && !dst.starts_with('/');
+            eprintln!("⇄ Syncing {} → {} ...", src, dst);
+            match (src_remote, dst_remote) {
+                (false, true) => {
+                    ecsctl::sync::run(&config, &src, &dst, None, 60).await?;
+                }
+                (true, false) => {
+                    ecsctl::sync::run_download(&config, &src, &dst, None, 60).await?;
+                }
+                _ => anyhow::bail!("exactly one of src/dst must be a remote path (agent:/path)"),
+            }
+            eprintln!("✓ Done");
+            Ok(())
         }
     }
 }
