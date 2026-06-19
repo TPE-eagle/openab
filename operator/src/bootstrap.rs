@@ -444,14 +444,14 @@ async fn show_status(config: &aws_config::SdkConfig) -> Result<()> {
 
 async fn ensure_role(iam: &IamClient, name: &str, _account: &str) -> Result<String> {
     match iam.get_role().role_name(name).send().await {
-        Ok(resp) => Ok(resp.role().arn().to_string()),
+        Ok(resp) => Ok(resp.role().context("no role in response")?.arn().to_string()),
         Err(_) => {
             let resp = iam.create_role()
                 .role_name(name)
                 .assume_role_policy_document(ASSUME_ROLE_POLICY)
                 .send().await
                 .with_context(|| format!("failed to create role {name}"))?;
-            Ok(resp.role().arn().to_string())
+            Ok(resp.role().context("no role in response")?.arn().to_string())
         }
     }
 }
@@ -475,33 +475,5 @@ async fn delete_role(iam: &IamClient, name: &str) {
 }
 
 fn chrono_now() -> String {
-    // UTC timestamp without chrono crate (YYYY-MM-DDTHH:MM:SSZ approximation)
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Convert to simple UTC string
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let mins = (time_secs % 3600) / 60;
-    let s = time_secs % 60;
-    // Days since 1970-01-01 to Y-M-D (simplified)
-    let mut y = 1970u64;
-    let mut remaining = days;
-    loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if remaining < days_in_year { break; }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days: [u64; 12] = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0;
-    for md in month_days {
-        if remaining < md { break; }
-        remaining -= md;
-        m += 1;
-    }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, remaining + 1, hours, mins, s)
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

@@ -43,7 +43,7 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<
 
     for m in &manifests {
         println!("  Applying {} (ECS)...", m.metadata.name);
-        apply_ecs(&ecs, &s3, m).await?;
+        apply_ecs(&ecs, &s3, aws_config, m).await?;
     }
 
     println!("\n{} service(s) applied.", manifests.len());
@@ -95,6 +95,7 @@ fn parse_manifest_file(path: &Path) -> Result<Vec<OABServiceManifest>> {
 async fn apply_ecs(
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
+    config: &aws_config::SdkConfig,
     m: &OABServiceManifest,
 ) -> Result<()> {
     let ecs_rt = match &m.spec.runtime {
