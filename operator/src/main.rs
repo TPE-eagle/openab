@@ -78,6 +78,24 @@ enum Commands {
         /// AWS region (defaults to AWS_DEFAULT_REGION or us-east-1)
         #[arg(long)]
         region: Option<String>,
+        /// Use existing ECS cluster (skip creation)
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Use existing VPC
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Use existing subnets (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        subnets: Option<Vec<String>>,
+        /// Use existing security group
+        #[arg(long, alias = "sg")]
+        security_group: Option<String>,
+        /// Use existing task execution role ARN
+        #[arg(long)]
+        execution_role: Option<String>,
+        /// Use existing task role ARN
+        #[arg(long)]
+        task_role: Option<String>,
     },
 }
 
@@ -131,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("✓ Done");
             Ok(())
         }
-        Commands::Bootstrap { delete, status, region } => {
+        Commands::Bootstrap { delete, status, region, cluster, vpc, subnets, security_group, execution_role, task_role } => {
             let cfg = if let Some(ref r) = region {
                 aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(aws_config::Region::new(r.clone()))
@@ -140,7 +158,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 config.clone()
             };
-            bootstrap::run(&cfg, delete, status).await
+            let imports = bootstrap::ImportOptions {
+                cluster,
+                vpc,
+                subnets,
+                security_group,
+                execution_role,
+                task_role,
+            };
+            bootstrap::run(&cfg, delete, status, imports).await
         }
     }
 }
