@@ -208,7 +208,7 @@ async fn list_vpcs(ec2: &Ec2Client) -> Result<Vec<VpcInfo>> {
     Ok(resp.vpcs().iter().map(|v| {
         let id = v.vpc_id().unwrap_or_default().to_string();
         let cidr = v.cidr_block().unwrap_or_default();
-        let is_default = v.is_default();
+        let is_default = v.is_default().unwrap_or(false);
         let name = v.tags().iter()
             .find(|t| t.key() == Some("Name"))
             .and_then(|t| t.value())
