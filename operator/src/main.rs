@@ -2,6 +2,7 @@ mod manifest;
 mod apply;
 mod bootstrap;
 mod config;
+mod create;
 mod get;
 mod delete;
 
@@ -21,6 +22,17 @@ enum Commands {
         /// Path to manifest file or directory
         #[arg(short, long)]
         file: String,
+        /// Sync local config.toml to S3 before applying
+        #[arg(long)]
+        sync: bool,
+    },
+    /// Interactive wizard to create a new agent
+    Create {
+        /// Agent name
+        name: String,
+        /// Namespace
+        #[arg(long, default_value = "prod")]
+        namespace: String,
     },
     /// List OAB services and their status
     Get {
@@ -105,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 
     match cli.command {
-        Commands::Apply { file } => apply::run(&config, &file).await,
+        Commands::Apply { file, sync } => apply::run(&config, &file, sync).await,
+        Commands::Create { name, namespace } => create::run(&config, &name, &namespace).await,
         Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
         Commands::Delete { resource, name, cluster, namespace } => {
             delete::run(&config, &resource, &name, &cluster, &namespace).await

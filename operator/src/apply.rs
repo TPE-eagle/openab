@@ -19,12 +19,31 @@ async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<Bootstra
     crate::bootstrap::load_state_pub(&s3, &bucket).await.ok().flatten()
 }
 
-pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<()> {
+pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool) -> Result<()> {
     let path = Path::new(file_path);
     let manifests = load_manifests(path)?;
 
     if manifests.is_empty() {
         anyhow::bail!("no manifests found at {}", file_path);
+    }
+
+    // --sync: upload local config.toml to S3 configFrom path
+    if sync_config {
+        let s3 = aws_sdk_s3::Client::new(aws_config);
+        for m in &manifests {
+            let config_path = path.parent().unwrap_or(Path::new(".")).join("config.toml");
+            if config_path.exists() && !m.spec.config_from.is_empty() {
+                let body = aws_sdk_s3::primitives::ByteStream::from_path(&config_path).await
+                    .context("failed to read local config.toml")?;
+                // Parse s3://bucket/key from configFrom
+                if let Some(s3_path) = m.spec.config_from.strip_prefix("s3://") {
+                    let (bucket, key) = s3_path.split_once('/').context("invalid configFrom S3 URI")?;
+                    s3.put_object().bucket(bucket).key(key).body(body).send().await
+                        .context("failed to sync config.toml to S3")?;
+                    eprintln!("  ⬆ Synced config.toml → {}", m.spec.config_from);
+                }
+            }
+        }
     }
 
     let ecs = aws_sdk_ecs::Client::new(aws_config);
