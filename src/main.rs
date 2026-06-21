@@ -482,15 +482,93 @@ async fn main() -> anyhow::Result<()> {
             let unified_dispatcher = Arc::new(dispatch::Dispatcher::new(router.clone(), 8, None));
             dispatchers.lock().unwrap().push(unified_dispatcher.clone());
 
-            // In unified mode, the GatewayAdapter is not needed for dispatch —
-            // process_gateway_event() submits directly to the Dispatcher.
-            // For reply routing, the gateway crate's platform-specific reply handlers
-            // are invoked directly (same as standalone gateway binary).
-            // For now, we create a minimal event context for the dispatch path.
+            // Bridge: reuse gateway crate's AppState + webhook handlers.
+            // Events flow: webhook → adapter handler → event_tx → bridge task → process_gateway_event() → Dispatcher
+            // This reuses 100% of existing adapter code (signature verify, parsing, etc).
+            let (event_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+
+            // Build gateway AppState (same as standalone binary)
+            let gw_state = Arc::new(openab_gateway::AppState {
+                telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok(),
+                telegram_secret_token: std::env::var("TELEGRAM_SECRET_TOKEN").ok(),
+                telegram_rich_messages: std::env::var("TELEGRAM_RICH_MESSAGES")
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true),
+                line_channel_secret: std::env::var("LINE_CHANNEL_SECRET").ok(),
+                line_access_token: std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok(),
+                #[cfg(feature = "teams")]
+                teams: openab_gateway::adapters::teams::TeamsConfig::from_env()
+                    .map(openab_gateway::adapters::teams::TeamsAdapter::new),
+                teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                #[cfg(feature = "feishu")]
+                feishu: openab_gateway::adapters::feishu::FeishuConfig::from_env()
+                    .map(openab_gateway::adapters::feishu::FeishuAdapter::new),
+                #[cfg(feature = "googlechat")]
+                google_chat: None, // TODO: wire up googlechat adapter config
+                #[cfg(feature = "wecom")]
+                wecom: openab_gateway::adapters::wecom::WecomConfig::from_env()
+                    .map(openab_gateway::adapters::wecom::WecomAdapter::new),
+                ws_token: None, // not needed in unified mode (no WS endpoint)
+                event_tx: event_tx.clone(),
+                reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    openab_gateway::LINE_WEBHOOK_CONCURRENCY_MAX,
+                )),
+                client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .expect("HTTP client must build"),
+            });
+
+            // Build axum router with platform webhook routes
+            let mut app = axum::Router::new()
+                .route("/health", axum::routing::get(|| async { "ok" }));
+
+            #[cfg(feature = "telegram")]
+            if gw_state.telegram_bot_token.is_some() {
+                let path = std::env::var("TELEGRAM_WEBHOOK_PATH")
+                    .unwrap_or_else(|_| "/webhook/telegram".into());
+                info!(path = %path, "unified: telegram adapter enabled");
+                app = app.route(&path, axum::routing::post(openab_gateway::adapters::telegram::webhook));
+            }
+
+            #[cfg(feature = "line")]
+            {
+                info!("unified: line adapter enabled");
+                app = app.route("/webhook/line", axum::routing::post(openab_gateway::adapters::line::webhook));
+            }
+
+            #[cfg(feature = "feishu")]
+            if gw_state.feishu.is_some() {
+                let path = std::env::var("FEISHU_WEBHOOK_PATH")
+                    .unwrap_or_else(|_| "/webhook/feishu".into());
+                info!(path = %path, "unified: feishu adapter enabled");
+                app = app.route(&path, axum::routing::post(openab_gateway::adapters::feishu::webhook));
+            }
+
+            #[cfg(feature = "wecom")]
+            if let Some(ref w) = gw_state.wecom {
+                info!(path = %w.config.webhook_path, "unified: wecom adapter enabled");
+                app = app
+                    .route(&w.config.webhook_path, axum::routing::get(openab_gateway::adapters::wecom::verify))
+                    .route(&w.config.webhook_path, axum::routing::post(openab_gateway::adapters::wecom::webhook));
+            }
+
+            #[cfg(feature = "teams")]
+            if gw_state.teams.is_some() {
+                let path = std::env::var("TEAMS_WEBHOOK_PATH")
+                    .unwrap_or_else(|_| "/webhook/teams".into());
+                info!(path = %path, "unified: teams adapter enabled");
+                app = app.route(&path, axum::routing::post(openab_gateway::adapters::teams::webhook));
+            }
+
+            let app = app.with_state(gw_state.clone());
+
+            // Bridge task: receive events from adapters via event_tx, dispatch to core
             let event_ctx = Arc::new(GatewayEventContext {
                 adapter: shared_discord_adapter.clone()
-                    .unwrap_or_else(|| shared_slack_adapter.clone()
-                        .expect("unified mode requires at least one core adapter")),
+                    .or_else(|| shared_slack_adapter.clone().map(|a| a as Arc<dyn adapter::ChatAdapter>))
+                    .expect("unified mode requires at least one core adapter configured"),
                 dispatcher: unified_dispatcher,
                 router: router.clone(),
                 allow_all_channels: true,
@@ -501,15 +579,31 @@ async fn main() -> anyhow::Result<()> {
                 stt_config: cfg.stt.clone(),
             });
 
-            let _event_ctx = event_ctx; // will be used when adapter routes are wired
+            // Spawn the event bridge (event_tx → process_gateway_event)
+            let mut event_rx = event_tx.subscribe();
+            let bridge_ctx = event_ctx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event_json) => {
+                            let ctx = bridge_ctx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = process_gateway_event(&event_json, &ctx).await {
+                                    tracing::warn!(error = %e, "unified bridge: event processing failed");
+                                }
+                            });
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "unified bridge: event_rx lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
 
             info!(addr = %listen_addr, "unified webhook server starting");
 
             Some(tokio::spawn(async move {
-                // Minimal health endpoint — adapters routes will be added per-platform
-                let app = axum::Router::new()
-                    .route("/health", axum::routing::get(|| async { "ok" }));
-
                 let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
                     Ok(l) => l,
                     Err(e) => {
