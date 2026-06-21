@@ -7,7 +7,7 @@
 //! Phase 1 supported keys:
 //! - `thread.name` — rename the current Discord/Slack thread
 
-use crate::adapter::{ChannelRef, ChatAdapter};
+use openab_core::adapter::{ChannelRef, ChatAdapter};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,6 +142,7 @@ pub fn new_registry() -> ThreadRegistry {
 }
 
 /// Register a thread→platform mapping. Called by adapters on message dispatch.
+#[allow(dead_code)]
 pub async fn register_thread(registry: &ThreadRegistry, thread_id: &str, platform: &str) {
     registry.write().await.insert(thread_id.to_string(), platform.to_string());
 }
@@ -206,14 +207,14 @@ impl CtlHandler for RuntimeHandler {
                 }
             }
             "thread.archived" => {
-                let Some((adapter, tid)) = self.resolve(thread_id).await else {
+                let Some((_adapter, tid)) = self.resolve(thread_id).await else {
                     return Response {
                         ok: false,
                         message: "unknown thread (use --thread or register via message dispatch)".into(),
                         value: None,
                     };
                 };
-                let archived = match value {
+                let _archived = match value {
                     "true" | "1" | "yes" => true,
                     "false" | "0" | "no" => false,
                     _ => {
@@ -224,27 +225,17 @@ impl CtlHandler for RuntimeHandler {
                         };
                     }
                 };
-                let channel = ChannelRef {
+                let _channel = ChannelRef {
                     platform: String::new(),
                     channel_id: tid,
                     thread_id: None,
                     parent_id: None,
                     origin_event_id: None,
                 };
-                match adapter.archive_thread(&channel, archived).await {
-                    Ok(()) => Response {
-                        ok: true,
-                        message: format!(
-                            "thread {}",
-                            if archived { "archived" } else { "unarchived" }
-                        ),
-                        value: None,
-                    },
-                    Err(e) => Response {
-                        ok: false,
-                        message: format!("archive failed: {e}"),
-                        value: None,
-                    },
+                Response {
+                    ok: false,
+                    message: "archive_thread not supported in workspace mode".into(),
+                    value: None,
                 }
             }
             "agent.status" => {

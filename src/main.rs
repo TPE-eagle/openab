@@ -1,41 +1,32 @@
-mod acp;
-mod adapter;
-mod allow_list;
-mod bot_turns;
-mod config;
-mod cron;
 mod ctl;
-mod directives;
-mod discord;
-mod dispatch;
-mod error_display;
-mod format;
-mod gateway;
-mod hooks;
-mod markdown;
-mod media;
-mod multibot_cache;
-mod reactions;
-mod remind;
-mod secrets;
-mod setup;
-mod slack;
-mod stt;
-mod timestamp;
+use openab_core::acp;
+use openab_core::adapter::{self, AdapterRouter};
+use openab_core::bot_turns;
+use openab_core::config;
+use openab_core::cron;
+#[cfg(feature = "discord")]
+use openab_core::discord;
+use openab_core::dispatch;
+use openab_core::gateway;
+use openab_core::hooks;
+use openab_core::multibot_cache;
+use openab_core::remind;
+use openab_core::secrets;
+use openab_core::setup;
+#[cfg(feature = "slack")]
+use openab_core::slack;
 
-use adapter::AdapterRouter;
 use clap::Parser;
+#[cfg(feature = "discord")]
 use serenity::gateway::GatewayError;
+#[cfg(feature = "discord")]
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
-/// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
-/// sends during pod termination, so handling it lets us run the full cleanup
-/// path (shard manager, ACP pool drain) instead of getting SIGKILL'd after the
-/// grace period.
+/// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -257,11 +248,6 @@ async fn main() -> anyhow::Result<()> {
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Dispatcher handles tracked here so SIGTERM cleanup can call shutdown() on each (ADR §6.8).
-    // Also shared with the cleanup task for periodic stale-entry sweeping.
-    // Arc<Mutex<Vec<…>>> because: outer Arc shared with cleanup task + shutdown,
-    // Mutex guards startup-time pushes, inner Arc<Dispatcher> shared with each adapter.
-    // All pushes happen at startup; runtime access is read-only (lock is uncontended).
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Spawn cleanup task
@@ -271,22 +257,25 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             cleanup_pool.cleanup_idle(ttl_secs).await;
-            // Sweep stale per-thread dispatcher entries (idle-exited consumers).
             for d in cleanup_dispatchers.lock().unwrap().iter() {
                 d.sweep_stale();
             }
         }
     });
 
-    // Pre-build shared adapters for cron scheduler (avoids duplicate Http clients / rate-limit buckets)
+    // Pre-build shared adapters for cron scheduler
+    #[cfg(feature = "discord")]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
         cfg.discord.as_ref().map(|dc| {
             let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
             Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
         });
+    #[cfg(not(feature = "discord"))]
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
+
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
 
-    // Initialize multibot cache (persists to $HOME/.openab/cache/threads.json)
+    // Initialize multibot cache
     let multibot_cache_path = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default()
@@ -295,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
         .join("threads.json");
     let multibot_cache = multibot_cache::MultibotCache::load(multibot_cache_path);
 
+    #[cfg(feature = "slack")]
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
         Arc::new(slack::SlackAdapter::new(
             s.bot_token.clone(),
@@ -304,6 +294,8 @@ async fn main() -> anyhow::Result<()> {
             multibot_cache.clone(),
         ))
     });
+    #[cfg(not(feature = "slack"))]
+    let shared_slack_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
     // Shared slot for Discord ShardMessenger (set in ready handler, used by ctl for agent.status)
     let ctl_shard: Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>> =
@@ -332,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
+    // Validate cronjob config at startup
     let mut configured_platforms: Vec<&str> = Vec::new();
     if cfg.discord.is_some() {
         configured_platforms.push("discord");
@@ -343,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
+    #[cfg(feature = "slack")]
     let slack_handle = if let Some(slack_cfg) = cfg.slack {
         let allow_all_channels =
             config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
@@ -367,9 +360,6 @@ async fn main() -> anyhow::Result<()> {
         let adapter = shared_slack_adapter
             .clone()
             .expect("shared_slack_adapter must exist when slack config is present");
-        // Dispatcher is the sole serialization path for all modes. Message = cap 1
-        // (each message dispatches alone, FIFO). Thread / Lane = configured cap;
-        // grouping decides whether senders share a buffer or get their own lane.
         let (slack_cap, slack_grouping, slack_idle) = dispatch::dispatch_params(
             &slack_cfg.message_processing_mode,
             slack_cfg.max_buffered_messages,
@@ -382,11 +372,8 @@ async fn main() -> anyhow::Result<()> {
             slack_idle,
         ));
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
-        let slack_ctl_registry = ctl_registry.clone();
-        let slack_allow_list: Arc<dyn allow_list::AllowListSource> =
-            Arc::new(allow_list::StaticAllowList::new(
-                slack_cfg.allowed_users.into_iter().collect(),
-            ));
+        let slack_allowed_users: std::collections::HashSet<String> =
+            slack_cfg.allowed_users.into_iter().collect();
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
@@ -394,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_all_channels,
                 allow_all_users,
                 slack_cfg.allowed_channels.into_iter().collect(),
-                slack_allow_list,
+                slack_allowed_users,
                 slack_cfg.allow_bot_messages,
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
@@ -402,7 +389,6 @@ async fn main() -> anyhow::Result<()> {
                 stt,
                 slack_shutdown_rx,
                 slack_dispatcher,
-                slack_ctl_registry,
             )
             .await
             {
@@ -412,6 +398,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    #[cfg(not(feature = "slack"))]
+    let slack_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Spawn Gateway adapter (background task)
     let gateway_handle = if let Some(gw_cfg) = cfg.gateway {
@@ -461,14 +449,33 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Spawn cron scheduler (background task) — reuses shared adapters
+    // Spawn cron scheduler (background task)
+    // Spawn embedded webhook server when gateway adapters are compiled in (unified mode).
+    // In unified mode, platform webhooks hit this axum server directly → Dispatcher.submit(),
+    // bypassing the WebSocket hop of the two-process model.
+    #[cfg(any(
+        feature = "telegram",
+        feature = "line",
+        feature = "feishu",
+        feature = "googlechat",
+        feature = "wecom",
+        feature = "teams",
+    ))]
+    let _unified_handle = {
+        // TODO(Phase 1): Wire each compiled-in adapter's webhook handler to axum routes
+        // and call Dispatcher.submit() directly instead of going through WS gateway.
+        // For now, the feature compiles the gateway crate (making the code available)
+        // but the full runtime integration (axum server, route registration, direct dispatch)
+        // will be completed in a follow-up PR.
+        None::<tokio::task::JoinHandle<()>>
+    };
+
     let usercron_path = if cfg.cron.usercron_enabled {
         cfg.cron.usercron_path.as_ref().map(|p| {
             let path = std::path::PathBuf::from(p);
             if path.is_absolute() {
                 path
             } else {
-                // Relative paths resolve from $HOME/.openab/ (e.g. "cronjob.toml" → "$HOME/.openab/cronjob.toml")
                 std::env::var("HOME")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_default()
@@ -489,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref a) = shared_discord_adapter {
             cron_adapters.insert("discord".into(), a.clone());
         }
+        #[cfg(feature = "slack")]
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
         }
@@ -511,6 +519,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
+    #[cfg(feature = "discord")]
     if let Some(discord_cfg) = cfg.discord {
         let allow_all_channels = config::resolve_allow_all(
             discord_cfg.allow_all_channels,
@@ -554,7 +563,7 @@ async fn main() -> anyhow::Result<()> {
         ));
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
-        // Initialize reminder store (persists to $HOME/.openab/reminders.json)
+        // Initialize reminder store
         let reminder_path = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default()
@@ -586,8 +595,6 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-            ctl_shard: ctl_shard.clone(),
-            ctl_registry: ctl_registry.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
@@ -600,7 +607,6 @@ async fn main() -> anyhow::Result<()> {
             .event_handler(handler)
             .await?;
 
-        // Graceful Discord shutdown on ctrl_c
         let shard_manager = client.shard_manager.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -629,7 +635,15 @@ async fn main() -> anyhow::Result<()> {
             Ok(_) => {}
         }
     } else {
-        // No Discord — wait for SIGINT or SIGTERM
+        info!("running without discord, press ctrl+c to stop");
+        shutdown_signal().await;
+        info!("shutdown signal received");
+    }
+    // When discord feature is disabled at compile time, use this fallback block.
+    // (When discord feature IS enabled but no [discord] config exists, the `else`
+    // branch of the `if let Some(discord_cfg)` above handles shutdown instead.)
+    #[cfg(not(feature = "discord"))]
+    {
         info!("running without discord, press ctrl+c to stop");
         shutdown_signal().await;
         info!("shutdown signal received");
@@ -641,7 +655,6 @@ async fn main() -> anyhow::Result<()> {
         h.abort();
         let _ = std::fs::remove_file(ctl::socket_path());
     }
-    // Signal Slack adapter to shut down gracefully
     let _ = shutdown_tx.send(true);
     if let Some(handle) = slack_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
@@ -650,16 +663,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
     if let Some(handle) = cron_handle {
-        // cron.rs drains in-flight tasks for up to 30s, so wait slightly longer
         let _ = tokio::time::timeout(std::time::Duration::from_secs(35), handle).await;
     }
-    // Drain per-thread dispatchers and log buffered_lost counts before pool shutdown (ADR §6.8).
     for d in dispatchers.lock().unwrap().iter() {
         d.shutdown();
     }
     let shutdown_pool = pool;
     shutdown_pool.shutdown().await;
-    // Run pre_shutdown hook after pool shutdown to guarantee no active sessions are writing.
     if let Some(ref hook) = shutdown_hook {
         if let Err(e) = hooks::run_hook("pre_shutdown", hook).await {
             error!(error = %e, "pre_shutdown hook failed");
@@ -696,7 +706,7 @@ mod tests {
     #[test]
     fn cli_no_args_defaults_to_run() {
         let cli = Cli::try_parse_from(["openab"]).unwrap();
-        assert!(cli.command.is_none()); // None → unwrap_or(Run { config: None })
+        assert!(cli.command.is_none());
     }
 
     #[test]

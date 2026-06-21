@@ -2,6 +2,7 @@
 name = "openab-gateway"
 version = "0.5.4"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -32,3 +33,12 @@ urlencoding = "2"
 
 [dev-dependencies]
 wiremock = "0.6"
+
+[features]
+default = ["telegram", "line", "feishu", "googlechat", "wecom", "teams"]
+telegram = []
+line = []
+feishu = []
+googlechat = []
+wecom = []
+teams = []

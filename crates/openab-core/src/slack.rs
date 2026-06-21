@@ -1,6 +1,5 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
-use crate::allow_list::AllowListSource;
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -713,7 +712,7 @@ pub async fn run_slack_adapter(
     allow_all_channels: bool,
     allow_all_users: bool,
     allowed_channels: HashSet<String>,
-    allowed_users: Arc<dyn AllowListSource>,
+    allowed_users: HashSet<String>,
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
@@ -721,7 +720,6 @@ pub async fn run_slack_adapter(
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
-    ctl_registry: crate::ctl::ThreadRegistry,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
@@ -828,10 +826,9 @@ pub async fn run_slack_adapter(
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
-                                                let allowed_users = allowed_users.allowed_users();
+                                                let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
-                                                let ctl_registry = ctl_registry.clone();
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
                                                     .unwrap_or("")
@@ -848,7 +845,6 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
-                                                        &ctl_registry,
                                                     )
                                                     .await;
                                                 });
@@ -1081,10 +1077,9 @@ pub async fn run_slack_adapter(
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
-                                                let allowed_users = allowed_users.allowed_users();
+                                                let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
-                                                let ctl_registry = ctl_registry.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -1097,7 +1092,6 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
-                                                        &ctl_registry,
                                                     )
                                                     .await;
                                                 });
@@ -1190,7 +1184,6 @@ async fn handle_message(
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
-    ctl_registry: &crate::ctl::ThreadRegistry,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1536,9 +1529,6 @@ async fn handle_message(
         other_bot_present,
         recipient: stream_recipient,
     };
-    // Register thread for ctl routing
-    let ctl_thread_id = thread_channel.thread_id.as_deref().unwrap_or(&thread_channel.channel_id);
-    crate::ctl::register_thread(ctl_registry, ctl_thread_id, "slack").await;
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
         .await

@@ -11,12 +11,12 @@ use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
     CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
-    EditMessage, EditThread, GetMessages,
+    EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -200,14 +200,6 @@ impl ChatAdapter for DiscordAdapter {
             .await?;
         Ok(())
     }
-
-    async fn archive_thread(&self, channel: &ChannelRef, archived: bool) -> anyhow::Result<()> {
-        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        ChannelId::new(ch_id)
-            .edit_thread(&self.http, EditThread::new().archived(archived))
-            .await?;
-        Ok(())
-    }
 }
 
 // --- Handler: serenity EventHandler that delegates to AdapterRouter ---
@@ -246,10 +238,6 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
-    /// Shared slot for ShardMessenger — set on ready, used by ctl server for agent.status.
-    pub ctl_shard: Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>,
-    /// Thread registry for ctl routing (thread_id → platform).
-    pub ctl_registry: crate::ctl::ThreadRegistry,
 }
 
 impl Handler {
@@ -708,6 +696,7 @@ impl EventHandler for Handler {
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+        let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -808,21 +797,7 @@ impl EventHandler for Handler {
                             error = %e,
                             "image attachment failed"
                         );
-                        let reason = match &e {
-                            media::MediaFetchError::SizeExceeded { .. } => "size exceeded".into(),
-                            media::MediaFetchError::Network(_) => "download failed: network error".into(),
-                            media::MediaFetchError::HttpStatus(s) => format!("download failed: HTTP {}", s.as_u16()),
-                            media::MediaFetchError::ProcessingFailed(_) => "processing failed: image encoding error".into(),
-                            media::MediaFetchError::UnsupportedResponseType { .. } => "unsupported format: unexpected content type".into(),
-                            media::MediaFetchError::InvalidImageBody { .. } => "unsupported format: not a valid image".into(),
-                            media::MediaFetchError::NotAnImage => "unsupported format: not an image".into(),
-                        };
-                        extra_blocks.push(ContentBlock::Text {
-                            text: format!(
-                                "[System: attachment \"{}\" was not delivered — {}]",
-                                attachment.filename, reason
-                            ),
-                        });
+                        failed_image_files.push(attachment.filename.clone());
                     }
                 }
             }
@@ -854,6 +829,23 @@ impl EventHandler for Handler {
             }
         };
 
+        // Notify user if any images couldn't be processed.
+        if !failed_image_files.is_empty() {
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| format!("`{}`", n.replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let warn_msg = format!(
+                ":warning: I couldn't process the image(s) you shared ({}). \
+                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP only).",
+                file_list
+            );
+            if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {
+                tracing::warn!(error = %e, "failed to send image warning to user");
+            }
+        }
+
         let trigger_msg = discord_msg_ref(&msg);
 
         // Per-thread streaming: check if another bot is present in this thread
@@ -872,7 +864,6 @@ impl EventHandler for Handler {
 
         let dispatcher = self.dispatcher.clone();
         let stt_cfg = self.stt_config.clone();
-        let ctl_registry = self.ctl_registry.clone();
 
         tokio::spawn(async move {
             // Best-effort echo before the agent reply so the user can verify STT.
@@ -901,7 +892,6 @@ impl EventHandler for Handler {
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
             };
-            crate::ctl::register_thread(&ctl_registry, &thread_channel.channel_id, "discord").await;
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
                 .await
@@ -911,259 +901,8 @@ impl EventHandler for Handler {
         });
     }
 
-    async fn reaction_add(&self, ctx: Context, reaction: Reaction) {
-        let bot_id = ctx.cache.current_user().id;
-
-        // Ignore bot's own reactions to prevent feedback loops.
-        if reaction.user_id == Some(bot_id) {
-            return;
-        }
-
-        // Extract unicode emoji string from the reaction.
-        let emoji_str = match &reaction.emoji {
-            ReactionType::Unicode(s) => s.clone(),
-            _ => {
-                tracing::debug!(emoji = ?reaction.emoji, "ignoring non-unicode reaction");
-                return;
-            }
-        };
-
-        // Look up mapping (early exit before any API calls).
-        let mapping = &self.router.reactions_config().mapping;
-        let prompt = match mapping.get(&emoji_str) {
-            Some(text) => text.clone(),
-            None => return, // emoji not mapped
-        };
-
-        let user_id = match reaction.user_id {
-            Some(id) => id,
-            None => return,
-        };
-
-        // Determine if reactor is a bot (from member hint or user fetch).
-        let is_reactor_bot = reaction
-            .member
-            .as_ref()
-            .map(|m| m.user.bot)
-            .unwrap_or(false);
-
-        // Bot gating: apply same allow_bot_messages policy as message().
-        if is_reactor_bot {
-            match self.allow_bot_messages {
-                AllowBots::Off => return,
-                // For reactions there is no @mention concept — treat as "not mentioned".
-                AllowBots::Mentions => return,
-                AllowBots::All => {
-                    // When trusted_bot_ids is configured, only those bots are allowed.
-                    if !self.trusted_bot_ids.is_empty()
-                        && !self.trusted_bot_ids.contains(&user_id.get())
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // User allowlist check (same as message() handler).
-        if is_denied_user(
-            is_reactor_bot,
-            self.allow_all_users,
-            &self.allowed_users,
-            user_id.get(),
-        ) {
-            return;
-        }
-
-        let adapter = self
-            .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
-            .clone();
-
-        let channel_id = reaction.channel_id;
-
-        // AllowUsers::Mentions means reactions cannot trigger (no @mention possible).
-        if self.allow_user_messages == AllowUsers::Mentions {
-            return;
-        }
-
-        // Snapshot participation state — use same API-backed check as message().
-        let (bot_involved, _) = self
-            .bot_participated_in_thread(&ctx.http, channel_id, bot_id)
-            .await;
-        // Snapshot multibot state: check both in-memory and disk cache (matches message()).
-        let other_bot_present = {
-            let cache = self.multibot_threads.lock().await;
-            cache.contains_key(&channel_id.to_string())
-        } || self.multibot_cache.is_multibot(&channel_id.to_string());
-
-        // In multibot threads, reaction target message's author determines which bot responds.
-        // message_author_id is provided by Discord in REACTION_ADD events.
-        let message_author_id = reaction.message_author_id;
-
-        let message_id = reaction.message_id;
-        let allow_all_channels = self.allow_all_channels;
-        let allowed_channels = self.allowed_channels.clone();
-        let allow_user_messages = self.allow_user_messages;
-        let allow_bot_messages = self.allow_bot_messages;
-        let trusted_bot_ids = self.trusted_bot_ids.clone();
-        let dispatcher = self.dispatcher.clone();
-        let ctl_registry = self.ctl_registry.clone();
-        let http = ctx.http.clone();
-
-        tokio::spawn(async move {
-            // Fetch user info for sender context.
-            let (sender_name, display_name, is_bot_confirmed) =
-                match user_id.to_user(&http).await {
-                    Ok(user) => {
-                        let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
-                        (user.name.clone(), display, user.bot)
-                    }
-                    Err(_) => {
-                        let fallback = user_id.to_string();
-                        (fallback.clone(), fallback, is_reactor_bot)
-                    }
-                };
-
-            // Defense-in-depth: if to_user() reveals this is a bot but member was
-            // None (rare edge case), re-apply bot gating retroactively.
-            if is_bot_confirmed && !is_reactor_bot {
-                match allow_bot_messages {
-                    AllowBots::Off | AllowBots::Mentions => return,
-                    AllowBots::All => {
-                        if !trusted_bot_ids.is_empty()
-                            && !trusted_bot_ids.contains(&user_id.get())
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let in_allowed_channel =
-                allow_all_channels || allowed_channels.contains(&channel_id.get());
-
-            // Thread detection: match detect_thread() logic.
-            let (thread_channel, is_thread) = match channel_id.to_channel(&http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    if gc.thread_metadata.is_some() {
-                        let parent = gc.parent_id.map(|p| p.get());
-                        let in_allowed_thread = in_allowed_channel
-                            || allow_all_channels
-                            || parent.is_some_and(|pid| allowed_channels.contains(&pid));
-                        if !in_allowed_thread {
-                            return;
-                        }
-                        (ChannelRef {
-                            platform: "discord".into(),
-                            channel_id: channel_id.get().to_string(),
-                            thread_id: None,
-                            parent_id: parent.map(|p| p.to_string()),
-                            origin_event_id: None,
-                        }, true)
-                    } else {
-                        if !in_allowed_channel {
-                            return;
-                        }
-                        (ChannelRef {
-                            platform: "discord".into(),
-                            channel_id: channel_id.get().to_string(),
-                            thread_id: None,
-                            parent_id: None,
-                            origin_event_id: None,
-                        }, false)
-                    }
-                }
-                _ => return,
-            };
-
-            // allow_user_messages gating (post thread-detection):
-            // In Involved/MultibotMentions mode, only respond in threads
-            // where the bot has participated. Non-thread channels are rejected.
-            // MultibotMentions additionally rejects when other bots are present.
-            match allow_user_messages {
-                AllowUsers::Mentions => return,
-                AllowUsers::Involved => {
-                    if !is_thread || !bot_involved {
-                        return;
-                    }
-                }
-                AllowUsers::MultibotMentions => {
-                    if !is_thread || !bot_involved {
-                        return;
-                    }
-                    // In multibot threads, the reaction target message's author
-                    // determines which bot responds. Only process if the user
-                    // reacted on THIS bot's message.
-                    if other_bot_present {
-                        match message_author_id {
-                            Some(author) if author == bot_id => {} // targeted at us
-                            _ => return,
-                        }
-                    }
-                }
-            }
-
-            let trigger_msg = MessageRef {
-                channel: ChannelRef {
-                    platform: "discord".into(),
-                    channel_id: channel_id.get().to_string(),
-                    thread_id: None,
-                    parent_id: None,
-                    origin_event_id: None,
-                },
-                message_id: message_id.to_string(),
-            };
-
-            let sender = SenderContext {
-                schema: "openab.sender.v1".into(),
-                sender_id: user_id.to_string(),
-                sender_name: sender_name.clone(),
-                display_name,
-                channel: "discord".into(),
-                channel_id: thread_channel
-                    .parent_id
-                    .as_deref()
-                    .unwrap_or(&thread_channel.channel_id)
-                    .to_string(),
-                thread_id: thread_channel.parent_id.as_ref().map(|_| thread_channel.channel_id.clone()),
-                is_bot: is_bot_confirmed,
-                timestamp: Some(chrono::Utc::now().to_rfc3339()),
-                message_id: Some(message_id.to_string()),
-                receiver_id: Some(bot_id.to_string()),
-            };
-
-            let sender_id = sender.sender_id.clone();
-            let sender_name_clone = sender.sender_name.clone();
-            let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
-            let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &[]);
-            let buf_msg = crate::dispatch::BufferedMessage {
-                sender_json,
-                sender_name: sender_name_clone,
-                prompt,
-                extra_blocks: Vec::new(),
-                trigger_msg,
-                arrived_at: std::time::Instant::now(),
-                estimated_tokens,
-                other_bot_present,
-                recipient: None,
-            };
-
-            crate::ctl::register_thread(&ctl_registry, &thread_channel.channel_id, "discord").await;
-            if let Err(e) = dispatcher
-                .submit(thread_key, thread_channel, adapter, buf_msg)
-                .await
-            {
-                error!("reaction mapping dispatcher submit error: {e}");
-            }
-        });
-    }
-
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
-
-        // Expose ShardMessenger to ctl server for agent.status presence updates.
-        let _ = self.ctl_shard.set(ctx.shard.clone());
 
         // Build the shared command list once.
         let commands = vec![

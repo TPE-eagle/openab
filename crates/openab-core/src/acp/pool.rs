@@ -286,8 +286,11 @@ impl SessionPool {
 
         if !resumed {
             new_conn.session_new(&effective_workdir).await?;
+            // Surface the reset banner both for restored sessions and for stale
+            // live entries that died before we could recover a resumable
+            // session id. In both cases the caller is continuing after an
+            // unexpected session loss.
             if had_existing || saved_session_id.is_some() {
-                // Genuine session loss (agent died, session file gone, etc.).
                 new_conn.session_reset = true;
             }
         }
