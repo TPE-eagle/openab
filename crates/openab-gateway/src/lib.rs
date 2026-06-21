@@ -66,8 +66,7 @@ impl Default for ServeConfig {
 /// Start the standalone gateway server. This is the main entry point extracted
 /// from the gateway binary — the binary becomes a thin wrapper around this.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
-    use axum::{extract::State, response::IntoResponse, routing::{get, post}, Router};
-    use futures_util::{SinkExt, StreamExt};
+    use axum::{routing::{get, post}, Router};
     use tracing::{info, warn};
 
     let ServeConfig { listen_addr, ws_token } = config;
