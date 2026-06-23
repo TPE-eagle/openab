@@ -57,9 +57,8 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 
 {{/* Resolve image: agent-level string override → unified default (repository:<tag>-<agent>).
-    When no per-agent image override is set, produces:
-      ghcr.io/openabdev/openab:<tag>-<agent>   (e.g. openab:beta-claude)
-      ghcr.io/openabdev/openab:<tag>            (for kiro, the default agent)
+    All agents use the same format: ghcr.io/openabdev/openab:<tag>-<agent>
+    There is no "default" agent — every agent must be explicitly identified in the tag.
     Per-agent image override (string with ":") is used verbatim for full backward compat.
     Call with: dict "ctx" $ "agent" $name "cfg" $cfg */}}
 {{- define "openab.agentImage" -}}
@@ -71,11 +70,7 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 {{- else }}
 {{- $tag := default .ctx.Chart.AppVersion .ctx.Values.image.tag }}
-{{- if eq .agent "kiro" }}
-{{- printf "%s:%s" .ctx.Values.image.repository $tag }}
-{{- else }}
 {{- printf "%s:%s-%s" .ctx.Values.image.repository $tag .agent }}
-{{- end }}
 {{- end }}
 {{- end }}
 

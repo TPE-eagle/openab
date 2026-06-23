@@ -1,13 +1,13 @@
-suite: agentImage unified tag format
+suite: agentImage unified tag format (no default agent)
 templates:
   - templates/deployment.yaml
 
 tests:
-  - it: kiro (default) resolves to openab:<appVersion> with no agent suffix
+  - it: kiro resolves to openab:<appVersion>-kiro (no bare tag)
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: "ghcr.io/openabdev/openab:0.9.0-beta.1"
+          value: "ghcr.io/openabdev/openab:0.9.0-beta.1-kiro"
 
   - it: non-kiro agent resolves to openab:<appVersion>-<agent>
     set:
@@ -18,13 +18,13 @@ tests:
           path: spec.template.spec.containers[0].image
           value: "ghcr.io/openabdev/openab:0.9.0-beta.1-claude"
 
-  - it: image.tag override applies to kiro
+  - it: image.tag override applies to kiro with suffix
     set:
       image.tag: "beta"
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: "ghcr.io/openabdev/openab:beta"
+          value: "ghcr.io/openabdev/openab:beta-kiro"
 
   - it: image.tag override applies to non-kiro agent with suffix
     set:
