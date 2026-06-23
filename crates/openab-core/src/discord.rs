@@ -954,16 +954,6 @@ impl EventHandler for Handler {
             }
         }
 
-        // User allowlist check (same as message() handler).
-        if is_denied_user(
-            is_reactor_bot,
-            self.allow_all_users,
-            &self.allowed_users,
-            user_id.get(),
-        ) {
-            return;
-        }
-
         let adapter = self
             .adapter
             .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
@@ -976,23 +966,27 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Snapshot participation state — use same API-backed check as message().
-        let (bot_involved, _) = self
-            .bot_participated_in_thread(&ctx.http, channel_id, bot_id)
-            .await;
-        // Snapshot multibot state: check both in-memory and disk cache (matches message()).
+        // F1 fix: Only check participation when gating mode requires it.
+        // This avoids unconditional API calls that cause rate-limiting.
+        let (bot_involved, _) =
+            if matches!(self.allow_user_messages, AllowUsers::Involved | AllowUsers::MultibotMentions) {
+                self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
+            } else {
+                (false, false)
+            };
+
+        // Snapshot multibot state: check both in-memory and disk cache.
         let other_bot_present = {
             let cache = self.multibot_threads.lock().await;
             cache.contains_key(&channel_id.to_string())
         } || self.multibot_cache.is_multibot(&channel_id.to_string());
 
-        // In multibot threads, reaction target message's author determines which bot responds.
-        // message_author_id is provided by Discord in REACTION_ADD events.
         let message_author_id = reaction.message_author_id;
-
         let message_id = reaction.message_id;
         let allow_all_channels = self.allow_all_channels;
+        let allow_all_users = self.allow_all_users;
         let allowed_channels = self.allowed_channels.clone();
+        let allowed_users = self.allowed_users.clone();
         let allow_user_messages = self.allow_user_messages;
         let allow_bot_messages = self.allow_bot_messages;
         let trusted_bot_ids = self.trusted_bot_ids.clone();
@@ -1000,7 +994,7 @@ impl EventHandler for Handler {
         let http = ctx.http.clone();
 
         tokio::spawn(async move {
-            // Fetch user info for sender context.
+            // F2 fix: Fetch user info first, then apply user gating with confirmed bot status.
             let (sender_name, display_name, is_bot_confirmed) =
                 match user_id.to_user(&http).await {
                     Ok(user) => {
@@ -1028,17 +1022,34 @@ impl EventHandler for Handler {
                 }
             }
 
+            // F2 fix: User allowlist check AFTER to_user() confirms bot status.
+            if is_denied_user(
+                is_bot_confirmed,
+                allow_all_users,
+                &allowed_users,
+                user_id.get(),
+            ) {
+                return;
+            }
+
             let in_allowed_channel =
                 allow_all_channels || allowed_channels.contains(&channel_id.get());
 
-            // Thread detection: match detect_thread() logic.
+            // F3 fix: Use detect_thread helper instead of manual reimplementation.
             let (thread_channel, is_thread) = match channel_id.to_channel(&http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    if gc.thread_metadata.is_some() {
-                        let parent = gc.parent_id.map(|p| p.get());
-                        let in_allowed_thread = in_allowed_channel
-                            || allow_all_channels
-                            || parent.is_some_and(|pid| allowed_channels.contains(&pid));
+                    let has_thread_metadata = gc.thread_metadata.is_some();
+                    let parent = gc.parent_id.map(|p| p.get());
+                    let (in_allowed_thread, _bot_owns) = detect_thread(
+                        has_thread_metadata,
+                        parent,
+                        gc.owner_id.map(|o| o.get()),
+                        bot_id.get(),
+                        &allowed_channels,
+                        allow_all_channels,
+                        in_allowed_channel,
+                    );
+                    if has_thread_metadata {
                         if !in_allowed_thread {
                             return;
                         }
@@ -1065,10 +1076,8 @@ impl EventHandler for Handler {
                 _ => return,
             };
 
-            // allow_user_messages gating (post thread-detection):
-            // In Involved/MultibotMentions mode, only respond in threads
-            // where the bot has participated. Non-thread channels are rejected.
-            // MultibotMentions additionally rejects when other bots are present.
+            // allow_user_messages gating (post thread-detection).
+            // bot_involved and other_bot_present were computed before spawn (F1 fix).
             match allow_user_messages {
                 AllowUsers::Mentions => return,
                 AllowUsers::Involved => {
@@ -1080,12 +1089,9 @@ impl EventHandler for Handler {
                     if !is_thread || !bot_involved {
                         return;
                     }
-                    // In multibot threads, the reaction target message's author
-                    // determines which bot responds. Only process if the user
-                    // reacted on THIS bot's message.
                     if other_bot_present {
                         match message_author_id {
-                            Some(author) if author == bot_id => {} // targeted at us
+                            Some(author) if author == bot_id => {}
                             _ => return,
                         }
                     }
@@ -1103,23 +1109,18 @@ impl EventHandler for Handler {
                 message_id: message_id.to_string(),
             };
 
-            let sender = SenderContext {
-                schema: "openab.sender.v1".into(),
-                sender_id: user_id.to_string(),
-                sender_name: sender_name.clone(),
-                display_name,
-                channel: "discord".into(),
-                channel_id: thread_channel
-                    .parent_id
-                    .as_deref()
-                    .unwrap_or(&thread_channel.channel_id)
-                    .to_string(),
-                thread_id: thread_channel.parent_id.as_ref().map(|_| thread_channel.channel_id.clone()),
-                is_bot: is_bot_confirmed,
-                timestamp: Some(chrono::Utc::now().to_rfc3339()),
-                message_id: Some(message_id.to_string()),
-                receiver_id: Some(bot_id.to_string()),
-            };
+            // F3 fix: Use build_sender_context helper.
+            let sender = build_sender_context(
+                &user_id.to_string(),
+                &sender_name,
+                &display_name,
+                &channel_id.get().to_string(),
+                thread_channel.parent_id.as_deref(),
+                is_bot_confirmed,
+                &chrono::Utc::now().to_rfc3339(),
+                &message_id.to_string(),
+                &bot_id.to_string(),
+            );
 
             let sender_id = sender.sender_id.clone();
             let sender_name_clone = sender.sender_name.clone();
