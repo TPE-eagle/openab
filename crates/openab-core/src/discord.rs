@@ -16,7 +16,7 @@ use serenity::builder::{
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -897,6 +897,248 @@ impl EventHandler for Handler {
                 .await
             {
                 error!("dispatcher submit error: {e}");
+            }
+        });
+    }
+
+    async fn reaction_add(&self, ctx: Context, reaction: Reaction) {
+        let bot_id = ctx.cache.current_user().id;
+
+        // Ignore bot's own reactions to prevent feedback loops.
+        if reaction.user_id == Some(bot_id) {
+            return;
+        }
+
+        // Extract unicode emoji string from the reaction.
+        let emoji_str = match &reaction.emoji {
+            ReactionType::Unicode(s) => s.clone(),
+            _ => {
+                tracing::debug!(emoji = ?reaction.emoji, "ignoring non-unicode reaction");
+                return;
+            }
+        };
+
+        // Look up mapping (early exit before any API calls).
+        let mapping = &self.router.reactions_config().mapping;
+        let prompt = match mapping.get(&emoji_str) {
+            Some(text) => text.clone(),
+            None => return, // emoji not mapped
+        };
+
+        let user_id = match reaction.user_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Determine if reactor is a bot (from member hint or user fetch).
+        let is_reactor_bot = reaction
+            .member
+            .as_ref()
+            .map(|m| m.user.bot)
+            .unwrap_or(false);
+
+        // Bot gating: apply same allow_bot_messages policy as message().
+        if is_reactor_bot {
+            match self.allow_bot_messages {
+                AllowBots::Off => return,
+                // For reactions there is no @mention concept — treat as "not mentioned".
+                AllowBots::Mentions => return,
+                AllowBots::All => {
+                    // When trusted_bot_ids is configured, only those bots are allowed.
+                    if !self.trusted_bot_ids.is_empty()
+                        && !self.trusted_bot_ids.contains(&user_id.get())
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
+
+        let channel_id = reaction.channel_id;
+
+        // AllowUsers::Mentions means reactions cannot trigger (no @mention possible).
+        if self.allow_user_messages == AllowUsers::Mentions {
+            return;
+        }
+
+        // --- Pre-spawn: channel/thread detection + allowlist + participation ---
+        // Doing this before spawn so we have &self for bot_participated_in_thread
+        // and can reject unallowed channels without any expensive API calls.
+
+        let in_allowed_channel =
+            self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
+
+        // F3 fix: Use detect_thread helper.
+        let (thread_channel, is_thread) = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let has_thread_metadata = gc.thread_metadata.is_some();
+                let parent = gc.parent_id.map(|p| p.get());
+                let (in_allowed_thread, _bot_owns) = detect_thread(
+                    has_thread_metadata,
+                    parent,
+                    gc.owner_id.map(|o| o.get()),
+                    bot_id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
+                if has_thread_metadata {
+                    if !in_allowed_thread {
+                        return;
+                    }
+                    (ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: parent.map(|p| p.to_string()),
+                        origin_event_id: None,
+                    }, true)
+                } else {
+                    if !in_allowed_channel {
+                        return;
+                    }
+                    (ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    }, false)
+                }
+            }
+            _ => return,
+        };
+
+        // F1 fix: Only call bot_participated_in_thread when the channel IS a
+        // thread AND gating mode requires it. This completely avoids the
+        // 200-message API fetch for non-thread channels and unallowed threads.
+        let (bot_involved, other_bot_present) = if is_thread
+            && matches!(
+                self.allow_user_messages,
+                AllowUsers::Involved | AllowUsers::MultibotMentions
+            ) {
+            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
+        } else {
+            // For non-thread: still check multibot cache for dispatch info.
+            let mb = {
+                let cache = self.multibot_threads.lock().await;
+                cache.contains_key(&channel_id.to_string())
+            } || self.multibot_cache.is_multibot(&channel_id.to_string());
+            (false, mb)
+        };
+
+        // Gating decision based on allow_user_messages mode.
+        let message_author_id = reaction.message_author_id;
+        let targets_this_bot = message_author_id.is_some_and(|a| a == bot_id);
+        if !should_process_reaction(
+            self.allow_user_messages,
+            is_thread,
+            bot_involved,
+            other_bot_present,
+            targets_this_bot,
+        ) {
+            return;
+        }
+
+        // --- Spawn: user resolution + is_denied_user + dispatch ---
+        let message_id = reaction.message_id;
+        let allow_all_users = self.allow_all_users;
+        let allowed_users = self.allowed_users.clone();
+        let allow_bot_messages = self.allow_bot_messages;
+        let trusted_bot_ids = self.trusted_bot_ids.clone();
+        let dispatcher = self.dispatcher.clone();
+        let http = ctx.http.clone();
+
+        tokio::spawn(async move {
+            // F2 fix: Fetch user info first, then apply user gating with confirmed bot status.
+            let (sender_name, display_name, is_bot_confirmed) =
+                match user_id.to_user(&http).await {
+                    Ok(user) => {
+                        let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
+                        (user.name.clone(), display, user.bot)
+                    }
+                    Err(_) => {
+                        let fallback = user_id.to_string();
+                        (fallback.clone(), fallback, is_reactor_bot)
+                    }
+                };
+
+            // Defense-in-depth: if to_user() reveals this is a bot but member was
+            // None (rare edge case), re-apply bot gating retroactively.
+            if is_bot_confirmed && !is_reactor_bot {
+                match allow_bot_messages {
+                    AllowBots::Off | AllowBots::Mentions => return,
+                    AllowBots::All => {
+                        if !trusted_bot_ids.is_empty()
+                            && !trusted_bot_ids.contains(&user_id.get())
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // F2 fix: User allowlist check AFTER to_user() confirms bot status.
+            if is_denied_user(
+                is_bot_confirmed,
+                allow_all_users,
+                &allowed_users,
+                user_id.get(),
+            ) {
+                return;
+            }
+
+            let trigger_msg = MessageRef {
+                channel: ChannelRef {
+                    platform: "discord".into(),
+                    channel_id: channel_id.get().to_string(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: None,
+                },
+                message_id: message_id.to_string(),
+            };
+
+            // F3 fix: Use build_sender_context helper.
+            let sender = build_sender_context(
+                &user_id.to_string(),
+                &sender_name,
+                &display_name,
+                &channel_id.get().to_string(),
+                thread_channel.parent_id.as_deref(),
+                is_bot_confirmed,
+                &chrono::Utc::now().to_rfc3339(),
+                &message_id.to_string(),
+                &bot_id.to_string(),
+            );
+
+            let sender_id = sender.sender_id.clone();
+            let sender_name_clone = sender.sender_name.clone();
+            let sender_json = serde_json::to_string(&sender).unwrap();
+            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
+            let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &[]);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json,
+                sender_name: sender_name_clone,
+                prompt,
+                extra_blocks: Vec::new(),
+                trigger_msg,
+                arrived_at: std::time::Instant::now(),
+                estimated_tokens,
+                other_bot_present,
+                recipient: None,
+            };
+
+            if let Err(e) = dispatcher
+                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .await
+            {
+                error!("reaction mapping dispatcher submit error: {e}");
             }
         });
     }
@@ -2253,6 +2495,39 @@ fn should_process_user_message(
     }
 }
 
+/// Pure decision function: should a reaction event be processed?
+/// Returns `true` if the reaction should trigger the mapped prompt.
+///
+/// Unlike message gating, reactions have no @mention concept. In
+/// MultibotMentions mode, targeting is determined by whether the reaction
+/// was placed on this bot's message (`targets_this_bot`).
+///
+/// This function is called AFTER:
+/// - channel/thread allowlist has passed
+/// - `is_thread` is known from `detect_thread`
+/// - `bot_involved` is from `bot_participated_in_thread` (only if is_thread)
+fn should_process_reaction(
+    mode: AllowUsers,
+    is_thread: bool,
+    bot_involved: bool,
+    other_bot_present: bool,
+    targets_this_bot: bool,
+) -> bool {
+    match mode {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => is_thread && bot_involved,
+        AllowUsers::MultibotMentions => {
+            if !is_thread || !bot_involved {
+                return false;
+            }
+            if other_bot_present {
+                return targets_this_bot;
+            }
+            true
+        }
+    }
+}
+
 /// Returns true if any bot message in `messages` contains a turn limit warning.
 /// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
 /// Note: this is best-effort — a narrow race window exists where two bots fetch
@@ -3199,5 +3474,104 @@ mod tests {
     #[test]
     fn dedup_returns_false_for_empty_messages() {
         assert!(!turn_limit_warning_present(&[]));
+    }
+
+    // --- should_process_reaction tests ---
+    // Pins the reaction gating logic to prevent regressions (F1/F2/F3 review cycle).
+
+    /// GIVEN: Mentions mode (reactions cannot @mention)
+    /// THEN:  always rejected
+    #[test]
+    fn reaction_mentions_mode_always_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::Mentions,
+            true, true, false, false,
+        ));
+    }
+
+    /// GIVEN: Involved mode, non-thread channel
+    /// THEN:  rejected (participation check never runs for non-threads)
+    #[test]
+    fn reaction_involved_non_thread_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::Involved,
+            false, // is_thread
+            false, // bot_involved (irrelevant for non-thread)
+            false, false,
+        ));
+    }
+
+    /// GIVEN: Involved mode, thread, bot NOT involved
+    /// THEN:  rejected
+    #[test]
+    fn reaction_involved_thread_not_participated_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::Involved,
+            true,  // is_thread
+            false, // bot_involved
+            false, false,
+        ));
+    }
+
+    /// GIVEN: Involved mode, thread, bot IS involved
+    /// THEN:  accepted
+    #[test]
+    fn reaction_involved_thread_participated_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::Involved,
+            true, // is_thread
+            true, // bot_involved
+            false, false,
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, single-bot thread, bot involved
+    /// THEN:  accepted (no multibot contention)
+    #[test]
+    fn reaction_multibot_single_bot_thread_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::MultibotMentions,
+            true,  // is_thread
+            true,  // bot_involved
+            false, // other_bot_present
+            false, // targets_this_bot (irrelevant when no other bot)
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, multi-bot thread, reaction targets THIS bot's message
+    /// THEN:  accepted
+    #[test]
+    fn reaction_multibot_targets_this_bot_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::MultibotMentions,
+            true, // is_thread
+            true, // bot_involved
+            true, // other_bot_present
+            true, // targets_this_bot
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, multi-bot thread, reaction targets OTHER bot's message
+    /// THEN:  rejected
+    #[test]
+    fn reaction_multibot_targets_other_bot_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::MultibotMentions,
+            true,  // is_thread
+            true,  // bot_involved
+            true,  // other_bot_present
+            false, // targets_this_bot
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, non-thread channel
+    /// THEN:  rejected
+    #[test]
+    fn reaction_multibot_non_thread_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::MultibotMentions,
+            false, // is_thread
+            false, false, false,
+        ));
     }
 }
