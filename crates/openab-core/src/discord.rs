@@ -1670,6 +1670,17 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
+        // Reject bot users — consistent with other slash-command handlers (e.g. /remind).
+        if cmd.user.bot {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🤖 Bots cannot use `/auth`.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
         // Access control — only allowed users can trigger auth.
         if is_denied_user(
             false,
@@ -1736,6 +1747,7 @@ impl Handler {
 
         let http = ctx.http.clone();
         let token = cmd.token.clone();
+        let user_id = cmd.user.id.get();
 
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
@@ -1751,7 +1763,7 @@ impl Handler {
             }
             let _guard = AuthGuard;
 
-            info!("/auth: starting auth command");
+            info!(user_id, "/auth: starting auth command");
 
             let child = TokioCommand::new("sh")
                 .arg("-c")
@@ -1789,7 +1801,7 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_out.lock().unwrap().push(line);
+                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
                         if has_url {
                             url_found_out.notify_one();
                         }
@@ -1804,7 +1816,7 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_err.lock().unwrap().push(line);
+                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
                         if has_url {
                             url_found_err.notify_one();
                         }
@@ -1812,19 +1824,60 @@ impl Handler {
                 }
             });
 
-            // Wait for a URL to appear or 30-second timeout.
+            // Wait for a URL to appear, the command to exit early, or a 30s timeout.
+            let mut early_exit: Option<std::io::Result<std::process::ExitStatus>> = None;
             tokio::select! {
                 _ = url_found.notified() => {
                     info!("/auth: URL detected in output");
                     // Brief sleep to let trailing lines (code/instructions) be captured.
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
+                res = child.wait() => {
+                    // The auth command exited before printing a URL — fail fast
+                    // instead of waiting out the full collection window.
+                    warn!("/auth: auth command exited before a URL was detected");
+                    early_exit = Some(res);
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     warn!("/auth: 30s URL-collection window expired without detecting URL");
                 }
             }
 
-            let collected_lines = lines.lock().unwrap().clone();
+            // Handle an early exit (the command terminated during the URL window).
+            if let Some(res) = early_exit {
+                let _ = tokio::join!(stdout_task, stderr_task);
+                let collected = lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .join("\n");
+                let detail = if collected.trim().is_empty() {
+                    String::new()
+                } else {
+                    let snippet: String = collected.chars().take(500).collect();
+                    format!("\n```\n{snippet}\n```")
+                };
+                let content = match res {
+                    Ok(status) if status.success() => {
+                        format!("✅ Auth command completed.{detail}")
+                    }
+                    Ok(status) => {
+                        format!(
+                            "❌ Auth command exited early ({status}) before producing a login URL.{detail}"
+                        )
+                    }
+                    Err(e) => format!("❌ Error waiting for auth command: {e}"),
+                };
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(content)
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
+                return;
+            }
+
+            let collected_lines = lines.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
             if collected_lines.is_empty() {
                 warn!("/auth: no output captured, killing child process");
@@ -1833,7 +1886,7 @@ impl Handler {
                 let _ = http.create_followup_message(
                     &token,
                     &CreateInteractionResponseFollowup::new()
-                        .content("⚠️ Auth command produced no output.")
+                        .content("⚠️ Auth command produced no output within 30 seconds. Verify `OPENAB_AGENT_AUTH_COMMAND` is set and prints a login URL to stdout/stderr.")
                         .ephemeral(true),
                     Vec::new(),
                 ).await;
@@ -1844,8 +1897,21 @@ impl Handler {
             let output = collected_lines.join("\n");
             let prefix = "🔐 **Agent Authentication**\n```\n";
             let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
-            let max_output_chars = 2000 - prefix.chars().count() - suffix.chars().count();
-            let truncated: String = output.chars().take(max_output_chars).collect();
+            // Discord enforces the 2000-char limit in UTF-16 code units, so budget
+            // and truncate by UTF-16 units rather than Unicode scalar values.
+            let budget = 2000usize
+                .saturating_sub(prefix.encode_utf16().count())
+                .saturating_sub(suffix.encode_utf16().count());
+            let mut truncated = String::new();
+            let mut used = 0usize;
+            for ch in output.chars() {
+                let w = ch.len_utf16();
+                if used + w > budget {
+                    break;
+                }
+                used += w;
+                truncated.push(ch);
+            }
             let msg = format!("{prefix}{truncated}{suffix}");
             let _ = http.create_followup_message(
                 &token,

@@ -1,6 +1,6 @@
 # Slash Commands
 
-OpenAB registers Discord slash commands for session control. These work in both guild threads and DMs.
+OpenAB registers Discord slash commands for session control and agent management. Most work in both guild threads and DMs — the exception is `/auth`, which is **DM-only** for security (see [`/auth`](#auth) below).
 
 ## Commands
 
@@ -10,7 +10,7 @@ OpenAB registers Discord slash commands for session control. These work in both 
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
-| `/auth` | Authenticate the backend agent via device flow | No |
+| `/auth` | Authenticate the backend agent via device flow (**DM-only**) | No |
 | `/remind` | Set a one-shot delayed reminder to mention users/roles | No |
 | `/export-thread` | Export thread/DM as `.txt` (default: last 100 messages) | No |
 
