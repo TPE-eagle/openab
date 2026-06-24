@@ -1729,6 +1729,7 @@ impl Handler {
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
             use tokio::process::Command as TokioCommand;
+            use std::sync::Arc;
 
             let child = TokioCommand::new("sh")
                 .arg("-c")
@@ -1752,90 +1753,57 @@ impl Handler {
                 }
             };
 
-            // Read stdout and stderr concurrently to capture device flow output.
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
 
-            let mut lines: Vec<String> = Vec::new();
+            let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let url_found = Arc::new(tokio::sync::Notify::new());
 
-            // Collect output from both streams until we find a URL or the process ends.
-            {
-                let mut stdout_reader = stdout.map(|s| tokio::io::BufReader::new(s).lines());
-                let mut stderr_reader = stderr.map(|s| tokio::io::BufReader::new(s).lines());
-
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-
-                loop {
-                    if tokio::time::Instant::now() > deadline {
-                        break;
-                    }
-
-                    tokio::select! {
-                        line = async {
-                            match stdout_reader.as_mut() {
-                                Some(r) => r.next_line().await,
-                                None => Ok(None),
-                            }
-                        } => {
-                            match line {
-                                Ok(Some(l)) => {
-                                    lines.push(l.clone());
-                                    if l.contains("http://") || l.contains("https://") {
-                                        // Read a few more lines to capture the code
-                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                        while let Some(reader) = stdout_reader.as_mut() {
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_millis(200),
-                                                reader.next_line()
-                                            ).await {
-                                                Ok(Ok(Some(l))) => lines.push(l),
-                                                _ => break,
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                                Ok(None) => { stdout_reader = None; }
-                                Err(_) => { stdout_reader = None; }
-                            }
+            // Spawn background drain tasks — they run to EOF, keeping pipes open.
+            let lines_out = lines.clone();
+            let url_found_out = url_found.clone();
+            let stdout_task = tokio::spawn(async move {
+                if let Some(stdout) = stdout {
+                    let mut reader = tokio::io::BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let has_url = line.contains("http://") || line.contains("https://");
+                        lines_out.lock().unwrap().push(line);
+                        if has_url {
+                            url_found_out.notify_one();
                         }
-                        line = async {
-                            match stderr_reader.as_mut() {
-                                Some(r) => r.next_line().await,
-                                None => Ok(None),
-                            }
-                        } => {
-                            match line {
-                                Ok(Some(l)) => {
-                                    lines.push(l.clone());
-                                    if l.contains("http://") || l.contains("https://") {
-                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                        while let Some(reader) = stderr_reader.as_mut() {
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_millis(200),
-                                                reader.next_line()
-                                            ).await {
-                                                Ok(Ok(Some(l))) => lines.push(l),
-                                                _ => break,
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                                Ok(None) => { stderr_reader = None; }
-                                Err(_) => { stderr_reader = None; }
-                            }
-                        }
-                    }
-
-                    if stdout_reader.is_none() && stderr_reader.is_none() {
-                        break;
                     }
                 }
-            } // readers dropped here; child still owns the pipes
+            });
 
-            if lines.is_empty() {
+            let lines_err = lines.clone();
+            let url_found_err = url_found.clone();
+            let stderr_task = tokio::spawn(async move {
+                if let Some(stderr) = stderr {
+                    let mut reader = tokio::io::BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let has_url = line.contains("http://") || line.contains("https://");
+                        lines_err.lock().unwrap().push(line);
+                        if has_url {
+                            url_found_err.notify_one();
+                        }
+                    }
+                }
+            });
+
+            // Wait for a URL to appear or 30-second timeout.
+            tokio::select! {
+                _ = url_found.notified() => {
+                    // Brief sleep to let trailing lines (code/instructions) be captured.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            }
+
+            let collected_lines = lines.lock().unwrap().clone();
+
+            if collected_lines.is_empty() {
                 let _ = child.kill().await;
+                let _ = tokio::join!(stdout_task, stderr_task);
                 let _ = http.create_followup_message(
                     &token,
                     &CreateInteractionResponseFollowup::new()
@@ -1847,8 +1815,8 @@ impl Handler {
                 return;
             }
 
-            // Send the captured output to the user (truncate to fit Discord's 2000-char limit).
-            let output = lines.join("\n");
+            // Send the captured output (truncated to Discord's 2000-char limit).
+            let output = collected_lines.join("\n");
             let prefix = "🔐 **Agent Authentication**\n```\n";
             let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
             let max_output = 2000 - prefix.len() - suffix.len();
@@ -1866,7 +1834,7 @@ impl Handler {
                 Vec::new(),
             ).await;
 
-            // Wait for the process to complete (user authorizes in browser)
+            // Wait for the process to complete (user authorizes in browser).
             let timeout = std::time::Duration::from_secs(15 * 60);
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(Ok(status)) if status.success() => {
@@ -1897,7 +1865,6 @@ impl Handler {
                     ).await;
                 }
                 Err(_) => {
-                    // Timeout — kill the process
                     let _ = child.kill().await;
                     let _ = http.create_followup_message(
                         &token,
@@ -1908,6 +1875,9 @@ impl Handler {
                     ).await;
                 }
             }
+
+            // Let background drain tasks complete.
+            let _ = tokio::join!(stdout_task, stderr_task);
             AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
         });
     }
