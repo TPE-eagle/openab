@@ -1035,9 +1035,7 @@ impl AdapterRouter {
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
-                        if let Some(err) = response_error {
-                            format!("⚠️ {err}")
-                        } else if turn_result.is_silent_failure() {
+                        if turn_result.is_silent_failure() {
                             warn!(
                                 stop_reason = ?turn_result.stop_reason,
                                 input_tokens = ?turn_result.input_tokens,
@@ -1045,10 +1043,8 @@ impl AdapterRouter {
                                 total_tokens = ?turn_result.total_tokens,
                                 "agent returned empty turn (0 output tokens) — likely provider/model/auth failure"
                             );
-                            SILENT_FAILURE_MSG.to_string()
-                        } else {
-                            "_(no response)_".to_string()
                         }
+                        classify_empty_turn(response_error.as_deref(), &turn_result)
                     } else if let Some(err) = response_error {
                         format!("⚠️ {err}\n\n{final_content}")
                     } else {
