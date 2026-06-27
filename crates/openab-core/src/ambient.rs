@@ -65,9 +65,9 @@ Rules:
 /// Falls back to `DEFAULT_AMBIENT_SYSTEM_INSTRUCTION` if the file does not exist.
 /// Truncates to `INSTRUCTIONS_FILE_MAX_CHARS` characters.
 fn load_instructions(path: &str) -> String {
-    let expanded = if path.starts_with("~/") {
+    let expanded = if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
-            std::path::PathBuf::from(home).join(&path[2..])
+            std::path::PathBuf::from(home).join(stripped)
         } else {
             std::path::PathBuf::from(path)
         }
