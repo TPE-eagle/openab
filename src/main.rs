@@ -517,7 +517,26 @@ async fn main() -> anyhow::Result<()> {
             let (event_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
             // Build gateway AppState from env vars (shared factory with standalone gateway)
-            let gw_state = Arc::new(openab_gateway::AppState::from_env(event_tx.clone(), None));
+            let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
+
+            // First-class `[telegram]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + TELEGRAM_* env fallback).
+            #[cfg_attr(not(feature = "telegram"), allow(unused_variables))]
+            let telegram_webhook_path = if let Some(ref tg) = cfg.telegram {
+                let r = tg.resolve();
+                let path = r.webhook_path.clone();
+                gw_state_inner.apply_telegram_config(
+                    r.bot_token,
+                    r.secret_token,
+                    r.rich_messages,
+                    r.trusted_source_only,
+                    r.streaming,
+                );
+                Some(path)
+            } else {
+                None
+            };
+            let gw_state = Arc::new(gw_state_inner);
 
             // Build axum router with platform webhook routes
             let mut app = axum::Router::new()
@@ -525,8 +544,10 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "telegram")]
             if gw_state.telegram_bot_token.is_some() {
-                let path = std::env::var("TELEGRAM_WEBHOOK_PATH")
-                    .unwrap_or_else(|_| "/webhook/telegram".into());
+                let path = telegram_webhook_path.clone().unwrap_or_else(|| {
+                    std::env::var("TELEGRAM_WEBHOOK_PATH")
+                        .unwrap_or_else(|_| "/webhook/telegram".into())
+                });
                 info!(path = %path, "unified: telegram adapter enabled");
                 app = app.route(&path, axum::routing::post(openab_gateway::adapters::telegram::webhook));
             }

@@ -29,6 +29,8 @@ pub struct AppState {
     pub telegram_secret_token: Option<String>,
     pub telegram_rich_messages: bool,
     pub telegram_trusted_source_only: bool,
+    /// Streaming override. `None` = follow `telegram_rich_messages`.
+    pub telegram_streaming: Option<bool>,
     pub line_channel_secret: Option<String>,
     pub line_access_token: Option<String>,
     #[cfg(feature = "teams")]
@@ -64,6 +66,7 @@ impl AppState {
             telegram_secret_token: None,
             telegram_rich_messages: false,
             telegram_trusted_source_only: false,
+            telegram_streaming: None,
             line_channel_secret: None,
             line_access_token: None,
             #[cfg(feature = "teams")]
@@ -98,6 +101,9 @@ impl AppState {
         let telegram_trusted_source_only = std::env::var("TELEGRAM_TRUSTED_SOURCE_ONLY")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let telegram_streaming = std::env::var("TELEGRAM_STREAMING")
+            .ok()
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")));
 
         // LINE
         let line_channel_secret = std::env::var("LINE_CHANNEL_SECRET").ok();
@@ -166,6 +172,7 @@ impl AppState {
             telegram_secret_token,
             telegram_rich_messages,
             telegram_trusted_source_only,
+            telegram_streaming,
             line_channel_secret,
             line_access_token,
             #[cfg(feature = "teams")]
@@ -183,6 +190,25 @@ impl AppState {
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
             client,
         }
+    }
+
+    /// Apply resolved `[telegram]` config values, overriding the env-derived
+    /// fields. Plain parameters keep this crate free of an `openab-core`
+    /// dependency (the binary crate resolves config → these values).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_telegram_config(
+        &mut self,
+        bot_token: Option<String>,
+        secret_token: Option<String>,
+        rich_messages: bool,
+        trusted_source_only: bool,
+        streaming: Option<bool>,
+    ) {
+        self.telegram_bot_token = bot_token;
+        self.telegram_secret_token = secret_token;
+        self.telegram_rich_messages = rich_messages;
+        self.telegram_trusted_source_only = trusted_source_only;
+        self.telegram_streaming = streaming;
     }
 }
 
@@ -402,6 +428,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         telegram_trusted_source_only: std::env::var("TELEGRAM_TRUSTED_SOURCE_ONLY")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        telegram_streaming: std::env::var("TELEGRAM_STREAMING")
+            .ok()
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))),
         line_channel_secret,
         line_access_token,
         #[cfg(feature = "teams")]
