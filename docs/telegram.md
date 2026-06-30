@@ -66,6 +66,32 @@ Streaming is enabled by default when Rich Messages are active — replies are st
 
 No `[gateway]` section needed — the unified adapter activates automatically when `TELEGRAM_BOT_TOKEN` is set.
 
+### First-class `[telegram]` config (optional)
+
+Instead of (or in addition to) the `TELEGRAM_*` env vars, you can configure Telegram as a first-class section in `config.toml` — symmetric with `[discord]` / `[slack]`:
+
+```toml
+[telegram]
+bot_token           = "${TELEGRAM_BOT_TOKEN}"   # ${} env expansion supported
+secret_token        = "${TELEGRAM_SECRET_TOKEN}" # webhook signature validation
+trusted_source_only = true     # reject requests outside Telegram's IP subnets
+rich_messages       = true     # sendRichMessage rendering (default true)
+streaming           = true     # override; defaults to follow rich_messages
+webhook_path        = "/webhook/telegram"
+```
+
+**Precedence (per field):** `[telegram]` value (with `${}` expansion) → `TELEGRAM_*` env var → built-in default. This is config-authoritative and matches `[discord]`/`[slack]`. Any field you omit falls back to its env var, so existing env-only deployments keep working unchanged.
+
+| `[telegram]` field | Env fallback | Default |
+|--------------------|--------------|---------|
+| `bot_token` | `TELEGRAM_BOT_TOKEN` | — |
+| `secret_token` | `TELEGRAM_SECRET_TOKEN` | — |
+| `trusted_source_only` | `TELEGRAM_TRUSTED_SOURCE_ONLY` | `false` |
+| `rich_messages` | `TELEGRAM_RICH_MESSAGES` | `true` |
+| `streaming` | `TELEGRAM_STREAMING` | follows `rich_messages` |
+| `webhook_path` | `TELEGRAM_WEBHOOK_PATH` | `/webhook/telegram` |
+
+
 ### Set the Webhook
 
 ```bash
