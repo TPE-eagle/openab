@@ -64,7 +64,7 @@ tables = "off"
 
 Streaming is enabled by default when Rich Messages are active — replies are streamed live via `sendRichMessageDraft` with rich formatting, then finalized with `sendRichMessage`. If `TELEGRAM_RICH_MESSAGES=false`, streaming is also disabled by default. To override, set `TELEGRAM_STREAMING=true` or `TELEGRAM_STREAMING=false` explicitly.
 
-No `[gateway]` section needed — the unified adapter activates automatically when `TELEGRAM_BOT_TOKEN` is set.
+No `[gateway]` section needed — the unified adapter activates automatically when `TELEGRAM_BOT_TOKEN` is set, or when the `[telegram]` section is configured in `config.toml`.
 
 ### First-class `[telegram]` config (optional)
 
@@ -90,6 +90,8 @@ webhook_path        = "/webhook/telegram"
 | `rich_messages` | `TELEGRAM_RICH_MESSAGES` | `true` |
 | `streaming` | `TELEGRAM_STREAMING` | follows `rich_messages` |
 | `webhook_path` | `TELEGRAM_WEBHOOK_PATH` | `/webhook/telegram` |
+
+> **Tip**: You can run a pure config-only deployment — no `TELEGRAM_*` env vars needed. Just set `bot_token = "your-token"` directly in `[telegram]` and the adapter will activate from config alone.
 
 
 ### Set the Webhook
