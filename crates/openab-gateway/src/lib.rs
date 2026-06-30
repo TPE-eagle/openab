@@ -193,23 +193,26 @@ impl AppState {
     }
 
     /// Apply resolved `[telegram]` config values, overriding the env-derived
-    /// fields. Plain parameters keep this crate free of an `openab-core`
-    /// dependency (the binary crate resolves config → these values).
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_telegram_config(
-        &mut self,
-        bot_token: Option<String>,
-        secret_token: Option<String>,
-        rich_messages: bool,
-        trusted_source_only: bool,
-        streaming: Option<bool>,
-    ) {
-        self.telegram_bot_token = bot_token;
-        self.telegram_secret_token = secret_token;
-        self.telegram_rich_messages = rich_messages;
-        self.telegram_trusted_source_only = trusted_source_only;
-        self.telegram_streaming = streaming;
+    /// fields. Accepts a `GatewayTelegramConfig` to keep this crate free of an
+    /// `openab-core` dependency (the binary crate resolves config → this struct).
+    pub fn apply_telegram_config(&mut self, cfg: GatewayTelegramConfig) {
+        self.telegram_bot_token = cfg.bot_token;
+        self.telegram_secret_token = cfg.secret_token;
+        self.telegram_rich_messages = cfg.rich_messages;
+        self.telegram_trusted_source_only = cfg.trusted_source_only;
+        self.telegram_streaming = cfg.streaming;
     }
+}
+
+/// Parameter object for passing resolved Telegram config across the crate
+/// boundary without introducing a dependency on `openab-core`.
+#[derive(Debug, Clone)]
+pub struct GatewayTelegramConfig {
+    pub bot_token: Option<String>,
+    pub secret_token: Option<String>,
+    pub rich_messages: bool,
+    pub trusted_source_only: bool,
+    pub streaming: Option<bool>,
 }
 
 // --- Public serve() entry point ---

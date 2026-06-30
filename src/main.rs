@@ -525,13 +525,13 @@ async fn main() -> anyhow::Result<()> {
             let telegram_webhook_path = if let Some(ref tg) = cfg.telegram {
                 let r = tg.resolve();
                 let path = r.webhook_path.clone();
-                gw_state_inner.apply_telegram_config(
-                    r.bot_token,
-                    r.secret_token,
-                    r.rich_messages,
-                    r.trusted_source_only,
-                    r.streaming,
-                );
+                gw_state_inner.apply_telegram_config(openab_gateway::GatewayTelegramConfig {
+                    bot_token: r.bot_token,
+                    secret_token: r.secret_token,
+                    rich_messages: r.rich_messages,
+                    trusted_source_only: r.trusted_source_only,
+                    streaming: r.streaming,
+                });
                 Some(path)
             } else {
                 None
