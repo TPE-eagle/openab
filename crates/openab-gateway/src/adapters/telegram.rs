@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Base URL for Telegram Bot API. Extracted as constant for consistency
 /// with LINE's `LINE_API_BASE` and to enable future mock testing.
@@ -506,32 +506,14 @@ pub async fn handle_reply(
     if reply.command.as_deref() == Some("add_reaction")
         || reply.command.as_deref() == Some("remove_reaction")
     {
-        // Show native "Thinking..." indicator via sendMessageDraft on first thinking emoji.
-        // Uses plain-text draft (not rich) — Telegram auto-clears it when the final
-        // sendMessage/sendRichMessage arrives in the same chat. No explicit dismiss needed.
-        // See: https://core.telegram.org/bots/api#sendmessagedraft
-        if rich_messages && reply.command.as_deref() == Some("add_reaction") {
-            let is_thinking = matches!(reply.content.text.as_str(), "👀" | "🤔" | "👨\u{200d}💻" | "🔥" | "⚡");
-            if is_thinking {
-                let draft_id = compute_draft_id(&reply.channel.id, &reply.channel.thread_id);
-                let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessageDraft");
-                let mut body = serde_json::json!({
-                    "chat_id": reply.channel.id,
-                    "draft_id": draft_id,
-                    "text": "",
-                });
-                if let Some(ref tid) = reply.channel.thread_id {
-                    body["message_thread_id"] = serde_json::json!(tid.parse::<i64>().unwrap_or(0));
-                }
-                let _ = client.post(&url).json(&body).send().await;
-            }
-        }
-        // No explicit dismiss on remove_reaction — the final reply auto-clears the draft.
-
         let msg_key = format!("{}:{}", reply.channel.id, reply.reply_to);
         let emoji = &reply.content.text;
         let tg_emoji = match emoji.as_str() {
             "🆗" => "👍",
+            // Mood faces are used on platforms that support multiple reactions (Discord).
+            // On Telegram (single reaction, non-premium), skip them to keep 👍 as the
+            // final "done" indicator instead of replacing it with a random face.
+            "😊" | "😎" | "🫡" | "🤓" | "😏" | "✌️" | "💪" | "🦾" => return,
             other => other,
         };
         let is_add = reply.command.as_deref() == Some("add_reaction");
@@ -539,9 +521,10 @@ pub async fn handle_reply(
             let mut reactions = reaction_state.lock().await;
             let set = reactions.entry(msg_key.clone()).or_default();
             if is_add {
-                if !set.contains(&tg_emoji.to_string()) {
-                    set.push(tg_emoji.to_string());
-                }
+                // Telegram private chats only allow 1 reaction per message (non-premium).
+                // Replace all existing reactions with the new one instead of accumulating.
+                set.clear();
+                set.push(tg_emoji.to_string());
             } else {
                 set.retain(|e| e != tg_emoji);
             }
@@ -558,16 +541,35 @@ pub async fn handle_reply(
                 .unwrap_or_default()
         };
         let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/setMessageReaction");
-        let _ = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "chat_id": reply.channel.id,
-                "message_id": reply.reply_to,
-                "reaction": current,
-            }))
-            .send()
-            .await
-            .map_err(|e| error!("telegram reaction error: {e}"));
+        let msg_id: i64 = match reply.reply_to.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(reply_to = %reply.reply_to, chat_id = %reply.channel.id, error = %e, "invalid message_id for reaction, skipping");
+                return;
+            }
+        };
+        let body = serde_json::json!({
+            "chat_id": reply.channel.id,
+            "message_id": msg_id,
+            "reaction": current,
+        });
+        debug!(
+            chat_id = %reply.channel.id,
+            message_id = msg_id,
+            emoji = %tg_emoji,
+            is_add,
+            "telegram reaction"
+        );
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    warn!(status = %status, body = %text, "setMessageReaction failed");
+                }
+            }
+            Err(e) => error!("telegram reaction error: {e}"),
+        }
         return;
     }
 
