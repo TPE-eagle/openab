@@ -147,6 +147,10 @@ When the task starts, ECS auto-registers its private IP as the DNS A record for
 `your-bot.oab`. Other services in the same VPC resolve this name to reach the task on
 `:8080`.
 
+> **ECS task-def naming**: Use the family name (resolves to latest ACTIVE revision)
+> or `family:revision` (e.g., `your-bot:1`). ECS does not support Docker-style
+> `:latest` tags.
+
 #### 3. Create a VPC Link
 
 ```bash
@@ -292,8 +296,9 @@ for Telegram/LINE.
    self-referencing SG rule on `:8080` usually covers it. If you see 503 from API
    Gateway, check your SG inbound rules first.
 
-2. **VPC Link subnets must be private**
-   VPC Link attaches to private subnets only. If your ECS task uses public subnets
+2. **VPC Link subnets should be private (recommended)**
+   VPC Link ENIs don't need public IPs, so private subnets are preferred.
+   Public subnets also work, but your VPC Link will still use private ENIs internally. If your ECS task uses public subnets
    with `assignPublicIp=ENABLED`, that's fine — the VPC Link still uses private
    subnets for its ENIs.
 
@@ -441,10 +446,10 @@ aws secretsmanager create-secret \
       "name": "openab",
       "image": "ghcr.io/openabdev/openab:0.9.0-beta.6-opencode",
       "portMappings": [{"containerPort": 8080}],
-      "environment": [
-        {"name": "TELEGRAM_BOT_TOKEN", "value": "123:abc"},
-        {"name": "LINE_CHANNEL_SECRET", "value": "xxx"},
-        {"name": "LINE_CHANNEL_ACCESS_TOKEN", "value": "yyy"}
+      "secrets": [
+        {"name": "TELEGRAM_BOT_TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456:secret:openab/telegram-bot-token:token::"},
+        {"name": "LINE_CHANNEL_SECRET", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456:secret:openab/line-shared:LINE_CHANNEL_SECRET::"},
+        {"name": "LINE_CHANNEL_ACCESS_TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456:secret:openab/line-shared:LINE_CHANNEL_ACCESS_TOKEN::"}
       ],
       "essential": true
     }
