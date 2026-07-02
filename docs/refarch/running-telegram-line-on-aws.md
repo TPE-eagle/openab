@@ -32,7 +32,7 @@ traffic to your Fargate task's `:8080` without paying for an ALB.**
 
 | # | Option | Monthly Cost | Best For |
 |---|--------|-------------|----------|
-| 1 | **API Gateway HTTP API + VPC Link + Cloud Map** | ~$5–10 | Single/multi bot, no ALB, lowest AWS-native cost |
+| 1 | **API Gateway HTTP API + VPC Link + Cloud Map** | ~$12–17 | Single/multi bot, no ALB, lowest AWS-native cost |
 | 2 | **ALB + ECS Fargate** | ~$20+ | Health checks, auto-scaling, enterprise |
 | 3 | **Cloudflare Tunnel sidecar** | ~$5–10 | Already have Cloudflare, simplest setup |
 
@@ -49,6 +49,11 @@ traffic to your Fargate task's `:8080` without paying for an ALB.**
 
 This is the cheapest AWS-native path. It replaces a $16+/month ALB with a ~$1/month
 API Gateway HTTP API and uses Cloud Map for service discovery instead of hardcoded IPs.
+
+> **Automation tip**: The `oabctl` operator (see [`operator/README.md`](../../operator/README.md))
+> automates this exact Option 1 setup — API Gateway + VPC Link + Cloud Map +
+> security group — via a declarative `spec.ingress` block. Once you understand the
+> manual steps below, consider using `oabctl apply` for production deployments.
 
 ### Architecture Diagram
 
@@ -68,7 +73,7 @@ API Gateway HTTP API and uses Cloud Map for service discovery instead of hardcod
           │   /webhook/telegram   │
           │   /webhook/line       │
           └───────────┬───────────┘
-                      │ VPC Link ($0 — free for HTTP API)
+                      │ VPC Link (~$0.01/hr/ENI)
                       ▼
           ┌───────────────────────┐
           │  AWS Cloud Map        │  ~$0 (private DNS)
@@ -291,13 +296,15 @@ for Telegram/LINE.
 | Resource | Monthly Cost |
 |----------|-------------|
 | API Gateway HTTP API | ~$1.00/million requests (effectively $0 for small bots) |
-| VPC Link | $0 (free for HTTP API; hourly charge only applies to REST API) |
+| VPC Link | ~$0.01/hr per ENI (~$7/month for a single ENI) |
 | Cloud Map | $0 (private DNS, minimal queries) |
 | ECS Fargate (256/512, 12h/day) | ~$5–10/month |
-| **Total** | **~$5–10/month** |
+| **Total** | **~$12–17/month** |
 
-> The HTTP API VPC Link is free — unlike REST API VPC Links which charge ~$0.01/hour.
-> This makes API Gateway the cheapest AWS-native ingress option for low-traffic bots.
+> VPC Link pricing is based on ENI-hour billing (approximately $0.01/hour per ENI).
+> REST API VPC Links are more expensive. This makes API Gateway the cheapest
+> AWS-native ingress option for low-traffic bots, though not as close to zero as
+> Cloudflare Tunnel.
 
 ### Pitfalls We Hit
 
@@ -326,7 +333,7 @@ for Telegram/LINE.
 
 | Pros | Cons |
 |------|------|
-| Cheapest AWS-native path (~$5–10/mo total) | VPC Link adds an extra network hop |
+| Cheapest AWS-native path (~$12–17/mo total) | VPC Link adds an extra network hop |
 | Webhook URL never changes (API Gateway endpoint is static) | One extra service to manage (API Gateway) |
 | Same infra for Telegram + LINE + Discord | Initial setup has more moving parts |
 | No ALB, no Kubernetes, no Cloudflare dependency | Debugging requires checking VPC Link logs |
@@ -389,8 +396,9 @@ Cloudflare, this is the simplest path.
 | ECS Fargate (256/512, 12h/day) | ~$5–10/month |
 | **Total** | **~$5–10/month** |
 
-> Same total as Option 1 — the difference is Cloudflare vs AWS for the ingress layer,
-> not the Fargate cost. Choose based on which ecosystem you already use.
+> Cheaper than Option 1 (~$12–17) — the difference is Cloudflare (free tunnel) vs
+> AWS VPC Link (~$7/month) for the ingress layer. Choose based on which ecosystem
+> you already use.
 
 ### Architecture (ECS Fargate)
 
@@ -537,7 +545,7 @@ POST /webhook/line      ─┼── same VPC Link → same Cloud Map → same t
 ```
 
 **Cost efficiency**: One task replaces three. The API Gateway + VPC Link is shared
-across all platforms. Total: **~$5–10/month for Telegram + LINE + Discord on a single
+across all platforms. Total: **~$12–17/month for Telegram + LINE + Discord on a single
 Fargate task.**
 
 ---
@@ -546,7 +554,7 @@ Fargate task.**
 
 | Factor | Option 1 (API GW + CM) | Option 2 (ALB) | Option 3 (CF Tunnel) |
 |--------|----------------------|----------------|---------------------|
-| Monthly cost | ~$5–10 | ~$18–21 | ~$5–10 |
+| Monthly cost | ~$12–17 | ~$18–21 | ~$5–10 |
 | Setup complexity | Medium | Low | Low |
 | AWS-native | ✅ Yes | ✅ Yes | ❌ No (CF dependency) |
 | Health checks | Manual | ✅ Built-in | Manual |
