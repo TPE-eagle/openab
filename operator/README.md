@@ -49,6 +49,40 @@ CLI tool that provisions and manages OpenAB agents on Amazon ECS Fargate (with K
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Installation
+
+`oabctl` ships attached to every `openab` release — it's built and uploaded to
+the same `openab-<version>` GitHub Release as soon as `charts/openab/Chart.yaml`
+is bumped on `main`, so it always tracks openab's own version:
+
+```bash
+# Download the latest release for your platform (linux-x86_64, linux-aarch64,
+# or macos-arm64) from:
+# https://github.com/openabdev/openab/releases/latest
+curl -L -o oabctl.tar.gz \
+  https://github.com/openabdev/openab/releases/latest/download/oabctl-<version>-<platform>.tar.gz
+tar xzf oabctl.tar.gz
+sudo mv oabctl /usr/local/bin/
+```
+
+Pre-beta builds (matching the rolling `pre-beta-<agent>` image tags, built
+hourly off `main`) are published to a rolling `oabctl-pre-beta` release —
+overwritten on every pre-beta build, so it always tracks the latest `main`:
+
+```bash
+curl -L -o oabctl.tar.gz \
+  https://github.com/openabdev/openab/releases/download/oabctl-pre-beta/oabctl-pre-beta-<platform>.tar.gz
+tar xzf oabctl.tar.gz
+sudo mv oabctl /usr/local/bin/
+```
+
+Or build from source (requires Rust):
+
+```bash
+cd operator && cargo build --release
+cp target/release/oabctl /usr/local/bin/
+```
+
 ## Quick Start
 
 ```bash
