@@ -217,4 +217,10 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         // The draft mechanism handles the "typing" indicator natively.
         false
     }
+
+    fn renders_native_tables(&self) -> bool {
+        // Telegram Rich Messages render markdown tables natively — skip the
+        // table→code-block pre-pass so tables display with proper formatting.
+        self.gw_state.telegram_rich_messages
+    }
 }

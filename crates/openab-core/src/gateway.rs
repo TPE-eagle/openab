@@ -730,6 +730,12 @@ impl ChatAdapter for GatewayAdapter {
     fn show_streaming_placeholder(&self) -> bool {
         self.streaming_placeholder
     }
+
+    fn renders_native_tables(&self) -> bool {
+        // Telegram renders markdown tables natively via Rich Messages;
+        // skip the table→code-block pre-pass for that platform.
+        self.platform_name == "telegram"
+    }
 }
 
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
