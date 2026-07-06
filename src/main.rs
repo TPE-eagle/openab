@@ -316,6 +316,39 @@ async fn main() -> anyhow::Result<()> {
                 ),
             );
         }
+
+        // Telegram: L3 (identity) mirrors the resolved
+        // [telegram].allow_all_users/allowed_users, so config.toml can
+        // restrict who can message the bot without needing
+        // GATEWAY_ALLOW_ALL_USERS/GATEWAY_ALLOWED_USERS env vars. L2
+        // (channels) has no Telegram-specific concept distinct from the
+        // generic gateway model, so it stays on the shared GATEWAY_* values
+        // set above.
+        //
+        // Also resolves when running env-only (no [telegram] section but
+        // TELEGRAM_BOT_TOKEN set), so TELEGRAM_ALLOWED_USERS /
+        // TELEGRAM_ALLOW_ALL_USERS are honored in pure-env deployments.
+        let telegram_resolved = if let Some(t) = &cfg.telegram {
+            Some(t.resolve())
+        } else if std::env::var("TELEGRAM_ALLOWED_USERS").is_ok()
+            || std::env::var("TELEGRAM_ALLOW_ALL_USERS").is_ok()
+        {
+            Some(config::TelegramConfig::default().resolve())
+        } else {
+            None
+        };
+        if let Some(r) = telegram_resolved {
+            reg.insert(
+                "telegram",
+                TrustConfig::new(
+                    Some(allow_all_channels),
+                    allowed_channels.clone(),
+                    None,
+                    Some(r.allow_all_users),
+                    r.allowed_users,
+                ),
+            );
+        }
         reg
     };
 
