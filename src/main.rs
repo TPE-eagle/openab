@@ -482,6 +482,10 @@ async fn main() -> anyhow::Result<()> {
     if cfg.slack.is_some() {
         configured_platforms.push("slack");
     }
+    #[cfg(feature = "telegram")]
+    if cfg.telegram.is_some() || std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
+        configured_platforms.push("telegram");
+    }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
@@ -614,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
     ))]
-    let _unified_handle = {
+    let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
         if has_unified_platform_env() || cfg.telegram.is_some() {
@@ -772,6 +776,8 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect();
 
+            let cron_unified_adapter = unified_adapter.clone();
+
             let event_ctx = Arc::new(GatewayEventContext {
                 adapter: unified_adapter,
                 dispatcher: unified_dispatcher,
@@ -816,7 +822,7 @@ async fn main() -> anyhow::Result<()> {
 
             info!(addr = %listen_addr, "unified webhook server starting");
 
-            Some(tokio::spawn(async move {
+            (Some(tokio::spawn(async move {
                 let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -828,9 +834,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = axum::serve(listener, app).await {
                     error!(error = %e, "unified webhook server error");
                 }
-            }))
+            })), Some(cron_unified_adapter))
         } else {
-            None
+            (None, None)
         }
     };
 
@@ -863,6 +869,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "slack")]
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
+        }
+        #[cfg(feature = "telegram")]
+        if let Some(ref a) = shared_unified_adapter {
+            cron_adapters.insert("telegram".into(), a.clone());
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
