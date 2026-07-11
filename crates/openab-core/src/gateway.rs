@@ -997,12 +997,16 @@ pub async fn run_gateway_adapter(
                                             }
                                             "text_file" => {
                                                 if let Ok(bytes) = bytes_result {
-                                                    const INLINE_LIMIT: u64 = 512 * 1024;
+                                                    let safe_filename: String = att.filename
+                                                        .chars()
+                                                        .filter(|c| !c.is_control())
+                                                        .take(200)
+                                                        .collect();
                                                     let size = bytes.len() as u64;
-                                                    if size <= INLINE_LIMIT {
+                                                    if size <= crate::media::TEXT_INLINE_LIMIT {
                                                         let text = String::from_utf8_lossy(&bytes);
                                                         extra_blocks.push(ContentBlock::Text {
-                                                            text: format!("```{}\n{}\n```", att.filename, text),
+                                                            text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
                                                         });
                                                     } else {
                                                         // Large file — upload to filestore if available
@@ -1016,8 +1020,7 @@ pub async fn run_gateway_adapter(
                                                                 tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
                                                                 extra_blocks.push(ContentBlock::Text {
                                                                     text: format!(
-                                                                        "[File: {}]\nThis file ({} KB) exceeds the configured upload limit and could not be stored.",
-                                                                        att.filename, size_kb
+                                                                        "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
                                                                     ),
                                                                 });
                                                             }
@@ -1025,7 +1028,7 @@ pub async fn run_gateway_adapter(
                                                             // No filestore configured — fall back to inline (original behavior)
                                                             let text = String::from_utf8_lossy(&bytes);
                                                             extra_blocks.push(ContentBlock::Text {
-                                                                text: format!("```{}\n{}\n```", att.filename, text),
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
                                                             });
                                                         }
                                                         #[cfg(not(feature = "filestore"))]
@@ -1033,7 +1036,7 @@ pub async fn run_gateway_adapter(
                                                             // Feature not compiled — inline as before
                                                             let text = String::from_utf8_lossy(&bytes);
                                                             extra_blocks.push(ContentBlock::Text {
-                                                                text: format!("```{}\n{}\n```", att.filename, text),
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
                                                             });
                                                         }
                                                     }
@@ -1416,12 +1419,16 @@ pub async fn process_gateway_event(
             "text_file" => {
                 match bytes_result {
                     Ok(bytes) => {
-                        const INLINE_LIMIT: u64 = 512 * 1024;
+                        let safe_filename: String = att.filename
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(200)
+                            .collect();
                         let size = bytes.len() as u64;
-                        if size <= INLINE_LIMIT {
+                        if size <= crate::media::TEXT_INLINE_LIMIT {
                             let text = String::from_utf8_lossy(&bytes);
                             extra_blocks.push(ContentBlock::Text {
-                                text: format!("```{}\n{}\n```", att.filename, text),
+                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
                             });
                         } else {
                             // Large file — upload to filestore if available
@@ -1435,8 +1442,7 @@ pub async fn process_gateway_event(
                                     tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
                                     extra_blocks.push(ContentBlock::Text {
                                         text: format!(
-                                            "[File: {}]\nThis file ({} KB) exceeds the configured upload limit and could not be stored.",
-                                            att.filename, size_kb
+                                            "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
                                         ),
                                     });
                                 }
@@ -1444,7 +1450,7 @@ pub async fn process_gateway_event(
                                 // No filestore configured — fall back to inline (original behavior)
                                 let text = String::from_utf8_lossy(&bytes);
                                 extra_blocks.push(ContentBlock::Text {
-                                    text: format!("```{}\n{}\n```", att.filename, text),
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
                                 });
                             }
                             #[cfg(not(feature = "filestore"))]
@@ -1452,7 +1458,7 @@ pub async fn process_gateway_event(
                                 // Feature not compiled — inline as before
                                 let text = String::from_utf8_lossy(&bytes);
                                 extra_blocks.push(ContentBlock::Text {
-                                    text: format!("```{}\n{}\n```", att.filename, text),
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
                                 });
                             }
                         }
